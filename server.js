@@ -18,9 +18,10 @@ console.log('📦 NODE_ENV:', process.env.NODE_ENV || 'development');
 const allowedOrigins = [
     'https://ermiasgelaye.github.io',
     'https://ermiasgelaye.github.io/Photography',
+    'https://ermiasgelaye.github.io/Photography/', // Add trailing slash
+    'https://ermiasgelaye.github.io/Photography/Home.html',
     'http://localhost:5500',
-    'http://localhost:3000',
-    'http://127.0.0.1:5500'
+    'http://localhost:3000'
 ];
 
 app.use(cors({
