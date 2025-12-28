@@ -21,7 +21,8 @@ const allowedOrigins = [
     'https://ermiasgelaye.github.io/Photography/', // Add trailing slash
     'https://ermiasgelaye.github.io/Photography/Home.html',
     'http://localhost:5500',
-    'http://localhost:3000'
+    'http://localhost:3000',
+    'https://photo-backend-xi.vercel.app'
 ];
 
 app.use(cors({
