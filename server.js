@@ -6,8 +6,8 @@ const app = express();
 
 // --- CONFIGURATION ---
 const SITE_BASE_URL = process.env.NODE_ENV === 'production' 
-    ? process.env.SITE_URL || 'https://ermiasgelaye.github.io/Photography'
-    : 'http://localhost:5500';
+    ? process.env.SITE_URL || 'https://photo-backend-xi.vercel.app'
+    : 'https://photo-backend-xi.vercel.app';
 
 console.log('🚀 Starting server...');
 console.log('🌐 Frontend URL:', SITE_BASE_URL);
