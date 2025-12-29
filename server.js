@@ -43,8 +43,8 @@ app.use(cors({
 app.use(express.json());
 
 // --- PAYMENT CONFIG ---
-const PRICE_AMOUNT_CENTS = 500; // $5.00
-const PRICE_AMOUNT_STRING = '5.00';
+const PRICE_AMOUNT_CENTS = 3000; // $30.00
+const PRICE_AMOUNT_STRING = '30.00';
 
 // --- STRIPE SETUP ---
 let stripe;
@@ -85,7 +85,7 @@ app.get('/api/health', (req, res) => {
 
 // --- STRIPE CHECKOUT ---
 app.post('/api/create-checkout-session', async (req, res) => {
-    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    if (!stripe) return res.status(3000).json({ error: 'Stripe not configured' });
 
     try {
         const session = await stripe.checkout.sessions.create({
@@ -97,7 +97,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
                         name: 'Unlimited Gallery Access',
                         description: 'High-resolution downloads for all photos',
                     },
-                    unit_amount: PRICE_AMOUNT_CENTS, // $5.00
+                    unit_amount: PRICE_AMOUNT_CENTS, // $30.00
                 },
                 quantity: 1,
             }],
@@ -109,13 +109,13 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
         res.json({ id: session.id });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(3000).json({ error: error.message });
     }
 });
 
 // --- PAYPAL ORDER CREATE ---
 app.post('/api/create-paypal-order', async (req, res) => {
-    if (!paypalClient) return res.status(500).json({ error: 'PayPal not configured' });
+    if (!paypalClient) return res.status(3000).json({ error: 'PayPal not configured' });
 
     try {
         const paypal = require('@paypal/checkout-server-sdk');
@@ -126,7 +126,7 @@ app.post('/api/create-paypal-order', async (req, res) => {
             purchase_units: [{
                 amount: {
                     currency_code: 'USD',
-                    value: PRICE_AMOUNT_STRING // '5.00'
+                    value: PRICE_AMOUNT_STRING // '30.00'
                 }
             }],
             application_context: {
@@ -140,13 +140,13 @@ app.post('/api/create-paypal-order', async (req, res) => {
         res.json({ id: order.result.id });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: error.message });
+        res.status(3000).json({ error: error.message });
     }
 });
 
 // --- PAYPAL ORDER CAPTURE ---
 app.post('/api/capture-paypal-order', async (req, res) => {
-    if (!paypalClient) return res.status(500).json({ error: 'PayPal not configured' });
+    if (!paypalClient) return res.status(3000).json({ error: 'PayPal not configured' });
 
     try {
         const { orderID } = req.body;
@@ -157,7 +157,7 @@ app.post('/api/capture-paypal-order', async (req, res) => {
         const capture = await paypalClient.execute(request);
         res.json({ capture: capture.result });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(3000).json({ error: error.message });
     }
 });
 
