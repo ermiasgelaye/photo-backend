@@ -6,7 +6,7 @@ const app = express();
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const SITE_BASE_URL = process.env.SITE_URL || 'https://ermiasgelaye.github.io/Photography/Home.html'; 
+const SITE_BASE_URL = process.env.SITE_URL || 'https://photo-backend-ten.vercel.app'; 
 
 console.log('🚀 Starting server...');
 console.log('🌐 Target Frontend URL:', SITE_BASE_URL);
