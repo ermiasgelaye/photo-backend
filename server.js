@@ -6,7 +6,7 @@ const app = express();
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const SITE_BASE_URL = process.env.SITE_URL || 'https://ermiasgelaye.github.io/Photography'; 
+const SITE_BASE_URL = process.env.SITE_URL || 'https://ermiasgelaye.github.io/Photography/Home.html'; 
 
 console.log('🚀 Starting server...');
 console.log('🌐 Target Frontend URL:', SITE_BASE_URL);
@@ -17,7 +17,9 @@ const allowedOrigins = [
     'https://ermiasgelaye.github.io/Photography',
     'http://127.0.0.1:5500',
     'http://localhost:5500',
-    'http://localhost:3000'
+    'http://localhost:3000',
+    'https://ermiasgelaye.github.io/Photography/Home.html'
+    
 ];
 
 app.use(cors({
