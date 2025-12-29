@@ -18,7 +18,9 @@ const allowedOrigins = [
     'http://127.0.0.1:5500',
     'http://localhost:5500',
     'http://localhost:3000',
-    'https://ermiasgelaye.github.io/Photography/Home.html'
+    'https://ermiasgelaye.github.io/Photography/Home.html',
+    'https://photo-backend-ten.vercel.app/'
+    
     
 ];
 
