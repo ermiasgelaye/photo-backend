@@ -5,7 +5,6 @@ require('dotenv').config();
 const app = express();
 
 // --- CONFIGURATION ---
-// If hosting on Vercel, this is handled automatically, but we set defaults
 const PORT = process.env.PORT || 3000;
 const SITE_BASE_URL = process.env.SITE_URL || 'https://ermiasgelaye.github.io/Photography'; 
 
@@ -13,7 +12,6 @@ console.log('🚀 Starting server...');
 console.log('🌐 Target Frontend URL:', SITE_BASE_URL);
 
 // --- CORS CONFIGURATION ---
-// We allow your GitHub pages and local testing
 const allowedOrigins = [
     'https://ermiasgelaye.github.io',
     'https://ermiasgelaye.github.io/Photography',
@@ -24,17 +22,13 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function(origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         
-        // Check if origin matches allowed list
         if (allowedOrigins.some(allowed => origin.startsWith(allowed))) {
             callback(null, true);
         } else {
             console.log('Blocked by CORS:', origin);
-            // In production, you might want to block this. For now, we log it.
-            // callback(new Error('Not allowed by CORS')); 
-            callback(null, true); // Temporarily allow all to prevent frontend errors during dev
+            callback(null, true); // Temporarily allow all
         }
     },
     credentials: true
@@ -58,18 +52,29 @@ let paypalClient = null;
 if (process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_SECRET) {
     try {
         const paypal = require('@paypal/checkout-server-sdk');
-        let environment = new paypal.core.SandboxEnvironment(
-            process.env.PAYPAL_CLIENT_ID,
-            process.env.PAYPAL_SECRET
-        );
-        // Uncomment for production:
-        // if (process.env.NODE_ENV === 'production') {
-        //    environment = new paypal.core.LiveEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_SECRET);
-        // }
+        
+        // Determine environment based on client ID
+        let environment;
+        if (process.env.PAYPAL_CLIENT_ID.startsWith('A')) {
+            // Live environment - production client IDs start with 'A'
+            console.log('🟢 Using PayPal LIVE environment');
+            environment = new paypal.core.LiveEnvironment(
+                process.env.PAYPAL_CLIENT_ID,
+                process.env.PAYPAL_SECRET
+            );
+        } else {
+            // Sandbox environment
+            console.log('🟡 Using PayPal SANDBOX environment');
+            environment = new paypal.core.SandboxEnvironment(
+                process.env.PAYPAL_CLIENT_ID,
+                process.env.PAYPAL_SECRET
+            );
+        }
+        
         paypalClient = new paypal.core.PayPalHttpClient(environment);
-        console.log('✅ PayPal initialized');
+        console.log('✅ PayPal client initialized successfully');
     } catch (e) {
-        console.error('PayPal init failed', e);
+        console.error('❌ PayPal init failed:', e.message);
     }
 }
 
@@ -80,12 +85,20 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date() });
+    res.json({ 
+        status: 'OK', 
+        timestamp: new Date(),
+        services: {
+            stripe: !!stripe,
+            paypal: !!paypalClient,
+            price: `$${PRICE_AMOUNT_STRING}`
+        }
+    });
 });
 
 // --- STRIPE CHECKOUT ---
 app.post('/api/create-checkout-session', async (req, res) => {
-    if (!stripe) return res.status(3000).json({ error: 'Stripe not configured' });
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
 
     try {
         const session = await stripe.checkout.sessions.create({
@@ -97,67 +110,160 @@ app.post('/api/create-checkout-session', async (req, res) => {
                         name: 'Unlimited Gallery Access',
                         description: 'High-resolution downloads for all photos',
                     },
-                    unit_amount: PRICE_AMOUNT_CENTS, // $30.00
+                    unit_amount: PRICE_AMOUNT_CENTS,
                 },
                 quantity: 1,
             }],
             mode: 'payment',
-            // IMPORTANT: Redirect back to index.html with query param
             success_url: `${SITE_BASE_URL}/index.html?payment=success`,
             cancel_url: `${SITE_BASE_URL}/index.html?payment=cancelled`,
         });
 
         res.json({ id: session.id });
     } catch (error) {
-        res.status(3000).json({ error: error.message });
+        console.error('Stripe error:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
 // --- PAYPAL ORDER CREATE ---
 app.post('/api/create-paypal-order', async (req, res) => {
-    if (!paypalClient) return res.status(3000).json({ error: 'PayPal not configured' });
+    console.log('📝 Creating PayPal order...');
+    
+    if (!paypalClient) {
+        console.error('PayPal client not configured');
+        return res.status(500).json({ error: 'PayPal not configured on server' });
+    }
 
     try {
         const paypal = require('@paypal/checkout-server-sdk');
         const request = new paypal.orders.OrdersCreateRequest();
         request.prefer("return=representation");
+        
         request.requestBody({
             intent: 'CAPTURE',
             purchase_units: [{
                 amount: {
                     currency_code: 'USD',
-                    value: PRICE_AMOUNT_STRING // '30.00'
-                }
+                    value: PRICE_AMOUNT_STRING
+                },
+                description: 'Unlimited Gallery Access'
             }],
             application_context: {
-                // Redirect back to main page
-                return_url: `${SITE_BASE_URL}/index.html?payment=success`,
-                cancel_url: `${SITE_BASE_URL}/index.html?payment=cancelled`
+                brand_name: 'ARC-NATURE PHOTOGRAPHY',
+                landing_page: 'BILLING',
+                user_action: 'PAY_NOW',
+                return_url: `${SITE_BASE_URL}/index.html?payment=success&method=paypal`,
+                cancel_url: `${SITE_BASE_URL}/index.html?payment=cancelled&method=paypal`
             }
         });
 
+        console.log('Sending PayPal order request...');
         const order = await paypalClient.execute(request);
-        res.json({ id: order.result.id });
+        console.log('✅ PayPal order created:', order.result.id);
+        
+        // Return the order ID
+        res.json({ 
+            success: true,
+            id: order.result.id,
+            status: order.result.status 
+        });
+        
     } catch (error) {
-        console.error(error);
-        res.status(3000).json({ error: error.message });
+        console.error('❌ PayPal order creation failed:', error);
+        
+        // Log detailed error
+        if (error.statusCode) {
+            console.error('Status:', error.statusCode);
+            console.error('Headers:', error.headers);
+            if (error.message) {
+                console.error('Message:', error.message);
+            }
+        }
+        
+        res.status(500).json({ 
+            error: 'Failed to create PayPal order',
+            details: error.message || 'Unknown error'
+        });
     }
 });
 
 // --- PAYPAL ORDER CAPTURE ---
 app.post('/api/capture-paypal-order', async (req, res) => {
-    if (!paypalClient) return res.status(3000).json({ error: 'PayPal not configured' });
+    console.log('💰 Capturing PayPal order...');
+    
+    if (!paypalClient) {
+        return res.status(500).json({ error: 'PayPal not configured' });
+    }
 
     try {
         const { orderID } = req.body;
+        
+        if (!orderID) {
+            return res.status(400).json({ error: 'Missing orderID' });
+        }
+
+        console.log('Capturing order:', orderID);
+        
         const paypal = require('@paypal/checkout-server-sdk');
         const request = new paypal.orders.OrdersCaptureRequest(orderID);
         request.requestBody({});
 
         const capture = await paypalClient.execute(request);
-        res.json({ capture: capture.result });
+        console.log('✅ PayPal order captured:', capture.result.id);
+        console.log('Status:', capture.result.status);
+        
+        // Return success with capture details
+        res.json({ 
+            success: true,
+            capture: capture.result,
+            message: 'Payment successful!'
+        });
+        
     } catch (error) {
-        res.status(3000).json({ error: error.message });
+        console.error('❌ PayPal capture failed:', error);
+        
+        // Log PayPal API error details
+        if (error.statusCode) {
+            console.error('Status Code:', error.statusCode);
+            console.error('Headers:', error.headers);
+            console.error('Details:', error.message);
+        }
+        
+        res.status(500).json({ 
+            error: 'Failed to capture PayPal payment',
+            details: error.message || 'Unknown error'
+        });
+    }
+});
+
+// --- TEST PAYPAL ENDPOINT ---
+app.get('/api/test-paypal', async (req, res) => {
+    try {
+        if (!paypalClient) {
+            return res.json({ 
+                configured: false,
+                message: 'PayPal not configured. Check PAYPAL_CLIENT_ID and PAYPAL_SECRET env vars.'
+            });
+        }
+        
+        // Try to get a token to test connection
+        const paypal = require('@paypal/checkout-server-sdk');
+        const request = new paypal.orders.OrdersCreateRequest();
+        
+        return res.json({
+            configured: true,
+            clientId: process.env.PAYPAL_CLIENT_ID ? 'Set' : 'Missing',
+            secret: process.env.PAYPAL_SECRET ? 'Set' : 'Missing',
+            environment: process.env.PAYPAL_CLIENT_ID?.startsWith('A') ? 'Live' : 'Sandbox',
+            message: 'PayPal SDK is configured'
+        });
+        
+    } catch (error) {
+        res.json({
+            configured: false,
+            error: error.message
+        });
     }
 });
 
