@@ -10,7 +10,8 @@ const SITE_BASE_URL = process.env.SITE_URL || 'https://photo-backend-ten.vercel.
 
 console.log('🚀 Starting server...');
 console.log('🌐 Target Frontend URL:', SITE_BASE_URL);
-
+// In your frontend HTML head, update the PayPal SDK script:
+<script src="https://www.paypal.com/sdk/js?client-id=AQ_jpAzGqFSS9drvNKT3bVLm8jDFL_wK9TqyE8vcVWLyNtbV3s3OFnw8AGWT49JkkOus6PKlHBxn1pIh&currency=USD&disable-funding=card"></script>
 // --- CORS CONFIGURATION ---
 const allowedOrigins = [
     'https://ermiasgelaye.github.io',
@@ -23,6 +24,71 @@ const allowedOrigins = [
     
     
 ];
+
+
+// Add this route to your server.js after other routes
+app.get('/api/debug-paypal', async (req, res) => {
+    try {
+        const isLive = process.env.PAYPAL_CLIENT_ID?.startsWith('A');
+        const clientIdFirst10 = process.env.PAYPAL_CLIENT_ID?.substring(0, 10) + '...';
+        const secretFirst5 = process.env.PAYPAL_SECRET?.substring(0, 5) + '...';
+        
+        res.json({
+            configured: !!paypalClient,
+            clientId: clientIdFirst10 || 'Not set',
+            secret: secretFirst5 || 'Not set',
+            environment: isLive ? 'Live' : 'Sandbox',
+            hasSdk: !!require('@paypal/checkout-server-sdk'),
+            timestamp: new Date().toISOString(),
+            suggestion: 'Check Vercel environment variables: PAYPAL_CLIENT_ID and PAYPAL_SECRET'
+        });
+    } catch (error) {
+        res.json({ error: error.message });
+    }
+});
+
+// Add a simple test order endpoint for frontend
+app.post('/api/test-paypal-simple', async (req, res) => {
+    try {
+        if (!paypalClient) {
+            return res.status(500).json({ 
+                error: 'PayPal not configured',
+                details: 'Check PAYPAL_CLIENT_ID and PAYPAL_SECRET env vars on Vercel'
+            });
+        }
+        
+        // Simple test order
+        const paypal = require('@paypal/checkout-server-sdk');
+        const request = new paypal.orders.OrdersCreateRequest();
+        
+        request.requestBody({
+            intent: 'CAPTURE',
+            purchase_units: [{
+                amount: {
+                    currency_code: 'USD',
+                    value: '1.00' // Small test amount
+                }
+            }]
+        });
+        
+        const order = await paypalClient.execute(request);
+        
+        res.json({
+            success: true,
+            test: true,
+            orderId: order.result.id,
+            status: 'PayPal connection successful'
+        });
+        
+    } catch (error) {
+        console.error('Test PayPal error:', error);
+        res.status(500).json({
+            error: error.message,
+            statusCode: error.statusCode,
+            headers: error.headers
+        });
+    }
+});
 
 app.use(cors({
     origin: function(origin, callback) {
