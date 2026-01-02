@@ -6,7 +6,7 @@ const app = express();
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const SITE_BASE_URL = process.env.SITE_URL || 'https://photo-backend-ten.vercel.app'; 
+const SITE_BASE_URL = process.env.SITE_URL || 'https://photo-backend-ten.vercel.app';
 
 console.log('🚀 Starting server...');
 console.log('🌐 Target Frontend URL:', SITE_BASE_URL);
@@ -410,9 +410,9 @@ app.post('/api/register-download', (req, res) => {
                 userId,
                 userFingerprint,
                 machineId,
-                downloadsUsed: downloadsUsed + 1,
-                unlimitedAccess: false,
-                downloadHistory: [{
+                    downloadsUsed: downloadsUsed + 1,
+                    unlimitedAccess: false,
+                    downloadHistory: [{
                     imageId,
                     imageTitle,
                     timestamp: Date.now(),
