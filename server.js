@@ -271,6 +271,253 @@ app.get('/api/test-paypal', async (req, res) => {
     }
 });
 
+// --- DOWNLOAD TRACKING SETUP ---
+// In-memory store for demo (use a database in production)
+let downloadTracker = new Map();
+
+// Clean up old entries daily
+setInterval(() => {
+    const now = Date.now();
+    const oneDay = 24 * 60 * 60 * 1000;
+    for (const [key, data] of downloadTracker.entries()) {
+        if (now - data.lastCheck > oneDay) {
+            downloadTracker.delete(key);
+        }
+    }
+}, 24 * 60 * 60 * 1000);
+
+// --- DOWNLOAD TRACKING API ---
+
+// 1. Check if user can download
+app.post('/api/check-download-allowance', (req, res) => {
+    try {
+        const { userId, userFingerprint } = req.body;
+        
+        if (!userId || !userFingerprint) {
+            return res.status(400).json({ error: 'Missing user identification' });
+        }
+        
+        const currentYear = new Date().getFullYear();
+        const key = `${userId}_${currentYear}`;
+        
+        // Check if user exists in tracker
+        let userData = downloadTracker.get(key);
+        
+        if (!userData) {
+            // New user for this year
+            userData = {
+                userId,
+                userFingerprint,
+                downloadsUsed: 0,
+                remainingDownloads: 3,
+                firstDownload: Date.now(),
+                lastDownload: null,
+                downloadHistory: [],
+                unlimitedAccess: false,
+                lastCheck: Date.now()
+            };
+            downloadTracker.set(key, userData);
+        }
+        
+        // Check for unlimited access (from payments)
+        if (userData.unlimitedAccess) {
+            return res.json({
+                canDownload: true,
+                remainingDownloads: 'unlimited',
+                unlimitedAccess: true
+            });
+        }
+        
+        // Check download limit
+        if (userData.downloadsUsed >= 3) {
+            return res.json({
+                canDownload: false,
+                remainingDownloads: 0,
+                message: 'You have used all free downloads for this year'
+            });
+        }
+        
+        res.json({
+            canDownload: true,
+            remainingDownloads: 3 - userData.downloadsUsed,
+            unlimitedAccess: false
+        });
+        
+    } catch (error) {
+        console.error('Download check error:', error);
+        res.status(500).json({ error: 'Failed to check download allowance' });
+    }
+});
+
+// 2. Register a download
+app.post('/api/register-download', (req, res) => {
+    try {
+        const { userId, userFingerprint, imageId, imageTitle } = req.body;
+        
+        if (!userId || !userFingerprint) {
+            return res.status(400).json({ error: 'Missing user identification' });
+        }
+        
+        const currentYear = new Date().getFullYear();
+        const key = `${userId}_${currentYear}`;
+        
+        let userData = downloadTracker.get(key);
+        
+        // Create new entry if doesn't exist
+        if (!userData) {
+            userData = {
+                userId,
+                userFingerprint,
+                downloadsUsed: 1,
+                remainingDownloads: 2,
+                firstDownload: Date.now(),
+                lastDownload: Date.now(),
+                downloadHistory: [{
+                    imageId,
+                    imageTitle,
+                    timestamp: Date.now(),
+                    ip: req.ip
+                }],
+                unlimitedAccess: false,
+                lastCheck: Date.now()
+            };
+        } else {
+            // Check for unlimited access
+            if (userData.unlimitedAccess) {
+                // Log download but don't count against limit
+                userData.downloadHistory.push({
+                    imageId,
+                    imageTitle,
+                    timestamp: Date.now(),
+                    ip: req.ip
+                });
+                userData.lastDownload = Date.now();
+                
+                return res.json({
+                    success: true,
+                    remainingDownloads: 'unlimited',
+                    unlimitedAccess: true
+                });
+            }
+            
+            // Check if already downloaded 3 times
+            if (userData.downloadsUsed >= 3) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Download limit reached. Please purchase unlimited access.'
+                });
+            }
+            
+            // Register download
+            userData.downloadsUsed += 1;
+            userData.remainingDownloads = 3 - userData.downloadsUsed;
+            userData.lastDownload = Date.now();
+            userData.downloadHistory.push({
+                imageId,
+                imageTitle,
+                timestamp: Date.now(),
+                ip: req.ip
+            });
+        }
+        
+        downloadTracker.set(key, userData);
+        
+        res.json({
+            success: true,
+            remainingDownloads: userData.remainingDownloads,
+            downloadsUsed: userData.downloadsUsed
+        });
+        
+    } catch (error) {
+        console.error('Register download error:', error);
+        res.status(500).json({ error: 'Failed to register download' });
+    }
+});
+
+// 3. Activate unlimited access (called after successful payment)
+app.post('/api/activate-unlimited', (req, res) => {
+    try {
+        const { userId, paymentId, paymentMethod } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'Missing user ID' });
+        }
+        
+        const currentYear = new Date().getFullYear();
+        const key = `${userId}_${currentYear}`;
+        
+        let userData = downloadTracker.get(key);
+        
+        if (!userData) {
+            // Create new user data
+            userData = {
+                userId,
+                downloadsUsed: 0,
+                remainingDownloads: 0,
+                unlimitedAccess: true,
+                unlimitedActivated: Date.now(),
+                paymentId,
+                paymentMethod,
+                lastCheck: Date.now()
+            };
+        } else {
+            // Update existing user
+            userData.unlimitedAccess = true;
+            userData.unlimitedActivated = Date.now();
+            userData.paymentId = paymentId;
+            userData.paymentMethod = paymentMethod;
+        }
+        
+        downloadTracker.set(key, userData);
+        
+        res.json({
+            success: true,
+            unlimitedAccess: true,
+            activated: userData.unlimitedActivated,
+            message: 'Unlimited downloads activated for 1 year'
+        });
+        
+    } catch (error) {
+        console.error('Activate unlimited error:', error);
+        res.status(500).json({ error: 'Failed to activate unlimited access' });
+    }
+});
+
+// 4. Get user download history
+app.get('/api/user-downloads/:userId', (req, res) => {
+    try {
+        const { userId } = req.params;
+        const currentYear = new Date().getFullYear();
+        const key = `${userId}_${currentYear}`;
+        
+        const userData = downloadTracker.get(key);
+        
+        if (!userData) {
+            return res.json({
+                downloadsUsed: 0,
+                remainingDownloads: 3,
+                unlimitedAccess: false,
+                downloadHistory: []
+            });
+        }
+        
+        // Don't expose sensitive data
+        res.json({
+            downloadsUsed: userData.downloadsUsed,
+            remainingDownloads: userData.unlimitedAccess ? 'unlimited' : userData.remainingDownloads,
+            unlimitedAccess: userData.unlimitedAccess || false,
+            downloadHistory: userData.downloadHistory || [],
+            unlimitedActivated: userData.unlimitedActivated || null
+        });
+        
+    } catch (error) {
+        console.error('Get user downloads error:', error);
+        res.status(500).json({ error: 'Failed to get download history' });
+    }
+});
+
+
+
 // Start server (for local dev)
 if (process.env.NODE_ENV !== 'production') {
     app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
