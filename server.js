@@ -20,8 +20,6 @@ const allowedOrigins = [
     'http://localhost:3000',
     'https://ermiasgelaye.github.io/Photography/Home.html',
     'https://photo-backend-ten.vercel.app/'
-    
-    
 ];
 
 app.use(cors({
@@ -82,6 +80,31 @@ if (process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_SECRET) {
     }
 }
 
+// --- DOWNLOAD TRACKING SETUP ---
+// In-memory store (use a database like MongoDB or PostgreSQL in production)
+let downloadTracker = new Map();
+let ipTracker = new Map();
+
+// Clean up old entries daily
+setInterval(() => {
+    const now = Date.now();
+    const oneDay = 24 * 60 * 60 * 1000;
+    
+    // Clean download tracker
+    for (const [key, data] of downloadTracker.entries()) {
+        if (now - data.lastCheck > (30 * oneDay)) { // 30 days
+            downloadTracker.delete(key);
+        }
+    }
+    
+    // Clean IP tracker
+    for (const [key, data] of ipTracker.entries()) {
+        if (now - data.lastCheck > (7 * oneDay)) { // 7 days
+            ipTracker.delete(key);
+        }
+    }
+}, 24 * 60 * 60 * 1000);
+
 // --- ROUTES ---
 
 app.get('/', (req, res) => {
@@ -95,7 +118,8 @@ app.get('/api/health', (req, res) => {
         services: {
             stripe: !!stripe,
             paypal: !!paypalClient,
-            price: `$${PRICE_AMOUNT_STRING}`
+            price: `$${PRICE_AMOUNT_STRING}`,
+            downloadTracking: true
         }
     });
 });
@@ -105,6 +129,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
 
     try {
+        const { userId } = req.body;
+        
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
             line_items: [{
@@ -119,8 +145,11 @@ app.post('/api/create-checkout-session', async (req, res) => {
                 quantity: 1,
             }],
             mode: 'payment',
-            success_url: `${SITE_BASE_URL}/index.html?payment=success`,
+            success_url: `${SITE_BASE_URL}/index.html?payment=success&userId=${userId}`,
             cancel_url: `${SITE_BASE_URL}/index.html?payment=cancelled`,
+            metadata: {
+                userId: userId || 'unknown'
+            }
         });
 
         res.json({ id: session.id });
@@ -166,7 +195,6 @@ app.post('/api/create-paypal-order', async (req, res) => {
         const order = await paypalClient.execute(request);
         console.log('✅ PayPal order created:', order.result.id);
         
-        // Return the order ID
         res.json({ 
             success: true,
             id: order.result.id,
@@ -175,15 +203,6 @@ app.post('/api/create-paypal-order', async (req, res) => {
         
     } catch (error) {
         console.error('❌ PayPal order creation failed:', error);
-        
-        // Log detailed error
-        if (error.statusCode) {
-            console.error('Status:', error.statusCode);
-            console.error('Headers:', error.headers);
-            if (error.message) {
-                console.error('Message:', error.message);
-            }
-        }
         
         res.status(500).json({ 
             error: 'Failed to create PayPal order',
@@ -215,9 +234,7 @@ app.post('/api/capture-paypal-order', async (req, res) => {
 
         const capture = await paypalClient.execute(request);
         console.log('✅ PayPal order captured:', capture.result.id);
-        console.log('Status:', capture.result.status);
         
-        // Return success with capture details
         res.json({ 
             success: true,
             capture: capture.result,
@@ -227,17 +244,367 @@ app.post('/api/capture-paypal-order', async (req, res) => {
     } catch (error) {
         console.error('❌ PayPal capture failed:', error);
         
-        // Log PayPal API error details
-        if (error.statusCode) {
-            console.error('Status Code:', error.statusCode);
-            console.error('Headers:', error.headers);
-            console.error('Details:', error.message);
-        }
-        
         res.status(500).json({ 
             error: 'Failed to capture PayPal payment',
             details: error.message || 'Unknown error'
         });
+    }
+});
+
+// --- DOWNLOAD TRACKING API ---
+
+// 1. Check if user can download
+app.post('/api/check-download-allowance', (req, res) => {
+    try {
+        const { userId, userFingerprint, machineId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'Missing user identification' });
+        }
+        
+        const currentYear = new Date().getFullYear();
+        const ip = req.ip;
+        
+        // Create keys for different tracking methods
+        const userKey = `${userId}_${currentYear}`;
+        const machineKey = machineId ? `machine_${machineId}_${currentYear}` : null;
+        const ipKey = `ip_${ip}_${currentYear}`;
+        
+        let downloadsUsed = 0;
+        let unlimitedAccess = false;
+        
+        // Check user tracking
+        let userData = downloadTracker.get(userKey);
+        if (userData) {
+            downloadsUsed = Math.max(downloadsUsed, userData.downloadsUsed);
+            unlimitedAccess = userData.unlimitedAccess || false;
+        }
+        
+        // Check machine tracking
+        if (machineKey) {
+            const machineData = downloadTracker.get(machineKey);
+            if (machineData) {
+                downloadsUsed = Math.max(downloadsUsed, machineData.downloadsUsed);
+                unlimitedAccess = unlimitedAccess || machineData.unlimitedAccess || false;
+            }
+        }
+        
+        // Check IP tracking
+        const ipData = ipTracker.get(ipKey);
+        if (ipData) {
+            downloadsUsed = Math.max(downloadsUsed, ipData.downloadsUsed);
+        }
+        
+        if (unlimitedAccess) {
+            return res.json({
+                canDownload: true,
+                remainingDownloads: 'unlimited',
+                unlimitedAccess: true,
+                downloadsUsed: downloadsUsed
+            });
+        }
+        
+        // Check download limit
+        if (downloadsUsed >= 3) {
+            return res.json({
+                canDownload: false,
+                remainingDownloads: 0,
+                downloadsUsed: downloadsUsed,
+                message: 'You have used all free downloads for this year'
+            });
+        }
+        
+        res.json({
+            canDownload: true,
+            remainingDownloads: 3 - downloadsUsed,
+            unlimitedAccess: false,
+            downloadsUsed: downloadsUsed
+        });
+        
+    } catch (error) {
+        console.error('Download check error:', error);
+        res.status(500).json({ error: 'Failed to check download allowance' });
+    }
+});
+
+// 2. Register a download
+app.post('/api/register-download', (req, res) => {
+    try {
+        const { userId, userFingerprint, machineId, imageId, imageTitle } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'Missing user identification' });
+        }
+        
+        const currentYear = new Date().getFullYear();
+        const ip = req.ip;
+        
+        // Create keys
+        const userKey = `${userId}_${currentYear}`;
+        const machineKey = machineId ? `machine_${machineId}_${currentYear}` : null;
+        const ipKey = `ip_${ip}_${currentYear}`;
+        
+        // Get existing data
+        let userData = downloadTracker.get(userKey);
+        let machineData = machineKey ? downloadTracker.get(machineKey) : null;
+        let ipData = ipTracker.get(ipKey);
+        
+        // Calculate current downloads used
+        let downloadsUsed = 0;
+        if (userData) downloadsUsed = Math.max(downloadsUsed, userData.downloadsUsed);
+        if (machineData) downloadsUsed = Math.max(downloadsUsed, machineData.downloadsUsed);
+        if (ipData) downloadsUsed = Math.max(downloadsUsed, ipData.downloadsUsed);
+        
+        // Check for unlimited access
+        let unlimitedAccess = false;
+        if (userData && userData.unlimitedAccess) unlimitedAccess = true;
+        if (machineData && machineData.unlimitedAccess) unlimitedAccess = true;
+        
+        if (unlimitedAccess) {
+            // Log download but don't count against limit
+            if (!userData) {
+                userData = {
+                    userId,
+                    userFingerprint,
+                    machineId,
+                    downloadsUsed: 0,
+                    unlimitedAccess: true,
+                    unlimitedActivated: Date.now(),
+                    downloadHistory: [],
+                    firstDownload: Date.now(),
+                    lastDownload: Date.now(),
+                    lastCheck: Date.now()
+                };
+            }
+            
+            userData.downloadHistory.push({
+                imageId,
+                imageTitle,
+                timestamp: Date.now(),
+                ip: ip
+            });
+            userData.lastDownload = Date.now();
+            downloadTracker.set(userKey, userData);
+            
+            return res.json({
+                success: true,
+                remainingDownloads: 'unlimited',
+                unlimitedAccess: true,
+                downloadsUsed: downloadsUsed
+            });
+        }
+        
+        // Check if already downloaded 3 times
+        if (downloadsUsed >= 3) {
+            return res.status(403).json({
+                success: false,
+                message: 'Download limit reached for this device. Please purchase unlimited access.',
+                remainingDownloads: 0,
+                downloadsUsed: downloadsUsed
+            });
+        }
+        
+        // Register download for user
+        if (!userData) {
+            userData = {
+                userId,
+                userFingerprint,
+                machineId,
+                downloadsUsed: downloadsUsed + 1,
+                unlimitedAccess: false,
+                downloadHistory: [{
+                    imageId,
+                    imageTitle,
+                    timestamp: Date.now(),
+                    ip: ip
+                }],
+                firstDownload: Date.now(),
+                lastDownload: Date.now(),
+                lastCheck: Date.now()
+            };
+        } else {
+            userData.downloadsUsed = downloadsUsed + 1;
+            userData.downloadHistory.push({
+                imageId,
+                imageTitle,
+                timestamp: Date.now(),
+                ip: ip
+            });
+            userData.lastDownload = Date.now();
+            userData.lastCheck = Date.now();
+        }
+        
+        // Register download for machine
+        if (machineKey) {
+            if (!machineData) {
+                machineData = {
+                    machineId,
+                    downloadsUsed: downloadsUsed + 1,
+                    userIds: [userId],
+                    firstDownload: Date.now(),
+                    lastDownload: Date.now(),
+                    lastCheck: Date.now()
+                };
+            } else {
+                machineData.downloadsUsed = downloadsUsed + 1;
+                machineData.lastDownload = Date.now();
+                machineData.lastCheck = Date.now();
+                if (!machineData.userIds.includes(userId)) {
+                    machineData.userIds.push(userId);
+                }
+            }
+            downloadTracker.set(machineKey, machineData);
+        }
+        
+        // Register download for IP
+        if (!ipData) {
+            ipData = {
+                ip,
+                downloadsUsed: downloadsUsed + 1,
+                userIds: [userId],
+                firstDownload: Date.now(),
+                lastDownload: Date.now(),
+                lastCheck: Date.now()
+            };
+        } else {
+            ipData.downloadsUsed = downloadsUsed + 1;
+            ipData.lastDownload = Date.now();
+            ipData.lastCheck = Date.now();
+            if (!ipData.userIds.includes(userId)) {
+                ipData.userIds.push(userId);
+            }
+        }
+        
+        downloadTracker.set(userKey, userData);
+        ipTracker.set(ipKey, ipData);
+        
+        const remainingDownloads = 3 - (downloadsUsed + 1);
+        
+        res.json({
+            success: true,
+            remainingDownloads: remainingDownloads,
+            downloadsUsed: downloadsUsed + 1,
+            message: remainingDownloads === 0 ? 'No downloads remaining!' : 
+                    remainingDownloads === 1 ? 'Only 1 download remaining!' : null
+        });
+        
+    } catch (error) {
+        console.error('Register download error:', error);
+        res.status(500).json({ error: 'Failed to register download' });
+    }
+});
+
+// 3. Activate unlimited access (called after successful payment)
+app.post('/api/activate-unlimited', (req, res) => {
+    try {
+        const { userId, paymentId, paymentMethod, machineId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'Missing user ID' });
+        }
+        
+        const currentYear = new Date().getFullYear();
+        const userKey = `${userId}_${currentYear}`;
+        const machineKey = machineId ? `machine_${machineId}_${currentYear}` : null;
+        
+        let userData = downloadTracker.get(userKey);
+        
+        if (!userData) {
+            userData = {
+                userId,
+                downloadsUsed: 0,
+                unlimitedAccess: true,
+                unlimitedActivated: Date.now(),
+                paymentId,
+                paymentMethod,
+                downloadHistory: [],
+                firstDownload: Date.now(),
+                lastDownload: null,
+                lastCheck: Date.now()
+            };
+        } else {
+            userData.unlimitedAccess = true;
+            userData.unlimitedActivated = Date.now();
+            userData.paymentId = paymentId;
+            userData.paymentMethod = paymentMethod;
+            userData.lastCheck = Date.now();
+        }
+        
+        downloadTracker.set(userKey, userData);
+        
+        // Also activate for machine if provided
+        if (machineKey) {
+            let machineData = downloadTracker.get(machineKey);
+            if (!machineData) {
+                machineData = {
+                    machineId,
+                    downloadsUsed: 0,
+                    unlimitedAccess: true,
+                    unlimitedActivated: Date.now(),
+                    userIds: [userId],
+                    firstDownload: Date.now(),
+                    lastDownload: null,
+                    lastCheck: Date.now()
+                };
+            } else {
+                machineData.unlimitedAccess = true;
+                machineData.unlimitedActivated = Date.now();
+                machineData.lastCheck = Date.now();
+                if (!machineData.userIds.includes(userId)) {
+                    machineData.userIds.push(userId);
+                }
+            }
+            downloadTracker.set(machineKey, machineData);
+        }
+        
+        res.json({
+            success: true,
+            unlimitedAccess: true,
+            activated: Date.now(),
+            expires: Date.now() + (365 * 24 * 60 * 60 * 1000), // 1 year
+            message: 'Unlimited downloads activated for 1 year'
+        });
+        
+    } catch (error) {
+        console.error('Activate unlimited error:', error);
+        res.status(500).json({ error: 'Failed to activate unlimited access' });
+    }
+});
+
+// 4. Get user download history
+app.get('/api/user-downloads/:userId', (req, res) => {
+    try {
+        const { userId } = req.params;
+        const currentYear = new Date().getFullYear();
+        const userKey = `${userId}_${currentYear}`;
+        
+        const userData = downloadTracker.get(userKey);
+        
+        if (!userData) {
+            return res.json({
+                downloadsUsed: 0,
+                remainingDownloads: 3,
+                unlimitedAccess: false,
+                downloadHistory: [],
+                firstDownload: null,
+                lastDownload: null
+            });
+        }
+        
+        // Don't expose sensitive data
+        res.json({
+            downloadsUsed: userData.downloadsUsed,
+            remainingDownloads: userData.unlimitedAccess ? 'unlimited' : (3 - userData.downloadsUsed),
+            unlimitedAccess: userData.unlimitedAccess || false,
+            downloadHistory: userData.downloadHistory || [],
+            firstDownload: userData.firstDownload || null,
+            lastDownload: userData.lastDownload || null,
+            unlimitedActivated: userData.unlimitedActivated || null
+        });
+        
+    } catch (error) {
+        console.error('Get user downloads error:', error);
+        res.status(500).json({ error: 'Failed to get download history' });
     }
 });
 
@@ -250,10 +617,6 @@ app.get('/api/test-paypal', async (req, res) => {
                 message: 'PayPal not configured. Check PAYPAL_CLIENT_ID and PAYPAL_SECRET env vars.'
             });
         }
-        
-        // Try to get a token to test connection
-        const paypal = require('@paypal/checkout-server-sdk');
-        const request = new paypal.orders.OrdersCreateRequest();
         
         return res.json({
             configured: true,
@@ -270,253 +633,6 @@ app.get('/api/test-paypal', async (req, res) => {
         });
     }
 });
-
-// --- DOWNLOAD TRACKING SETUP ---
-// In-memory store for demo (use a database in production)
-let downloadTracker = new Map();
-
-// Clean up old entries daily
-setInterval(() => {
-    const now = Date.now();
-    const oneDay = 24 * 60 * 60 * 1000;
-    for (const [key, data] of downloadTracker.entries()) {
-        if (now - data.lastCheck > oneDay) {
-            downloadTracker.delete(key);
-        }
-    }
-}, 24 * 60 * 60 * 1000);
-
-// --- DOWNLOAD TRACKING API ---
-
-// 1. Check if user can download
-app.post('/api/check-download-allowance', (req, res) => {
-    try {
-        const { userId, userFingerprint } = req.body;
-        
-        if (!userId || !userFingerprint) {
-            return res.status(400).json({ error: 'Missing user identification' });
-        }
-        
-        const currentYear = new Date().getFullYear();
-        const key = `${userId}_${currentYear}`;
-        
-        // Check if user exists in tracker
-        let userData = downloadTracker.get(key);
-        
-        if (!userData) {
-            // New user for this year
-            userData = {
-                userId,
-                userFingerprint,
-                downloadsUsed: 0,
-                remainingDownloads: 3,
-                firstDownload: Date.now(),
-                lastDownload: null,
-                downloadHistory: [],
-                unlimitedAccess: false,
-                lastCheck: Date.now()
-            };
-            downloadTracker.set(key, userData);
-        }
-        
-        // Check for unlimited access (from payments)
-        if (userData.unlimitedAccess) {
-            return res.json({
-                canDownload: true,
-                remainingDownloads: 'unlimited',
-                unlimitedAccess: true
-            });
-        }
-        
-        // Check download limit
-        if (userData.downloadsUsed >= 3) {
-            return res.json({
-                canDownload: false,
-                remainingDownloads: 0,
-                message: 'You have used all free downloads for this year'
-            });
-        }
-        
-        res.json({
-            canDownload: true,
-            remainingDownloads: 3 - userData.downloadsUsed,
-            unlimitedAccess: false
-        });
-        
-    } catch (error) {
-        console.error('Download check error:', error);
-        res.status(500).json({ error: 'Failed to check download allowance' });
-    }
-});
-
-// 2. Register a download
-app.post('/api/register-download', (req, res) => {
-    try {
-        const { userId, userFingerprint, imageId, imageTitle } = req.body;
-        
-        if (!userId || !userFingerprint) {
-            return res.status(400).json({ error: 'Missing user identification' });
-        }
-        
-        const currentYear = new Date().getFullYear();
-        const key = `${userId}_${currentYear}`;
-        
-        let userData = downloadTracker.get(key);
-        
-        // Create new entry if doesn't exist
-        if (!userData) {
-            userData = {
-                userId,
-                userFingerprint,
-                downloadsUsed: 1,
-                remainingDownloads: 2,
-                firstDownload: Date.now(),
-                lastDownload: Date.now(),
-                downloadHistory: [{
-                    imageId,
-                    imageTitle,
-                    timestamp: Date.now(),
-                    ip: req.ip
-                }],
-                unlimitedAccess: false,
-                lastCheck: Date.now()
-            };
-        } else {
-            // Check for unlimited access
-            if (userData.unlimitedAccess) {
-                // Log download but don't count against limit
-                userData.downloadHistory.push({
-                    imageId,
-                    imageTitle,
-                    timestamp: Date.now(),
-                    ip: req.ip
-                });
-                userData.lastDownload = Date.now();
-                
-                return res.json({
-                    success: true,
-                    remainingDownloads: 'unlimited',
-                    unlimitedAccess: true
-                });
-            }
-            
-            // Check if already downloaded 3 times
-            if (userData.downloadsUsed >= 3) {
-                return res.status(403).json({
-                    success: false,
-                    message: 'Download limit reached. Please purchase unlimited access.'
-                });
-            }
-            
-            // Register download
-            userData.downloadsUsed += 1;
-            userData.remainingDownloads = 3 - userData.downloadsUsed;
-            userData.lastDownload = Date.now();
-            userData.downloadHistory.push({
-                imageId,
-                imageTitle,
-                timestamp: Date.now(),
-                ip: req.ip
-            });
-        }
-        
-        downloadTracker.set(key, userData);
-        
-        res.json({
-            success: true,
-            remainingDownloads: userData.remainingDownloads,
-            downloadsUsed: userData.downloadsUsed
-        });
-        
-    } catch (error) {
-        console.error('Register download error:', error);
-        res.status(500).json({ error: 'Failed to register download' });
-    }
-});
-
-// 3. Activate unlimited access (called after successful payment)
-app.post('/api/activate-unlimited', (req, res) => {
-    try {
-        const { userId, paymentId, paymentMethod } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({ error: 'Missing user ID' });
-        }
-        
-        const currentYear = new Date().getFullYear();
-        const key = `${userId}_${currentYear}`;
-        
-        let userData = downloadTracker.get(key);
-        
-        if (!userData) {
-            // Create new user data
-            userData = {
-                userId,
-                downloadsUsed: 0,
-                remainingDownloads: 0,
-                unlimitedAccess: true,
-                unlimitedActivated: Date.now(),
-                paymentId,
-                paymentMethod,
-                lastCheck: Date.now()
-            };
-        } else {
-            // Update existing user
-            userData.unlimitedAccess = true;
-            userData.unlimitedActivated = Date.now();
-            userData.paymentId = paymentId;
-            userData.paymentMethod = paymentMethod;
-        }
-        
-        downloadTracker.set(key, userData);
-        
-        res.json({
-            success: true,
-            unlimitedAccess: true,
-            activated: userData.unlimitedActivated,
-            message: 'Unlimited downloads activated for 1 year'
-        });
-        
-    } catch (error) {
-        console.error('Activate unlimited error:', error);
-        res.status(500).json({ error: 'Failed to activate unlimited access' });
-    }
-});
-
-// 4. Get user download history
-app.get('/api/user-downloads/:userId', (req, res) => {
-    try {
-        const { userId } = req.params;
-        const currentYear = new Date().getFullYear();
-        const key = `${userId}_${currentYear}`;
-        
-        const userData = downloadTracker.get(key);
-        
-        if (!userData) {
-            return res.json({
-                downloadsUsed: 0,
-                remainingDownloads: 3,
-                unlimitedAccess: false,
-                downloadHistory: []
-            });
-        }
-        
-        // Don't expose sensitive data
-        res.json({
-            downloadsUsed: userData.downloadsUsed,
-            remainingDownloads: userData.unlimitedAccess ? 'unlimited' : userData.remainingDownloads,
-            unlimitedAccess: userData.unlimitedAccess || false,
-            downloadHistory: userData.downloadHistory || [],
-            unlimitedActivated: userData.unlimitedActivated || null
-        });
-        
-    } catch (error) {
-        console.error('Get user downloads error:', error);
-        res.status(500).json({ error: 'Failed to get download history' });
-    }
-});
-
-
 
 // Start server (for local dev)
 if (process.env.NODE_ENV !== 'production') {
