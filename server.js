@@ -1,15 +1,33 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const mongoose = require('mongoose');
+const Stripe = require('stripe');
+const paypal = require('@paypal/checkout-server-sdk');
+const { OpenAI } = require('openai');
 require('dotenv').config();
 
 const app = express();
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const SITE_BASE_URL = process.env.SITE_URL || 'https://photo-backend-ten.vercel.app';
+const SITE_BASE_URL = process.env.SITE_URL || 'https://arc-nature-photography.com';
 
-console.log('🚀 Starting server...');
-console.log('🌐 Target Frontend URL:', SITE_BASE_URL);
+console.log('🚀 Starting Enhanced Photography Gallery Server...');
+
+// --- SECURITY MIDDLEWARE ---
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            scriptSrc: ["'self'", "https://js.stripe.com", "https://www.paypal.com"],
+            imgSrc: ["'self'", "data:", "https:"],
+            connectSrc: ["'self'", "https://api.stripe.com", "https://api.paypal.com", "https://api.openai.com"]
+        }
+    }
+}));
 
 // --- CORS CONFIGURATION ---
 const allowedOrigins = [
@@ -18,169 +36,430 @@ const allowedOrigins = [
     'http://127.0.0.1:5500',
     'http://localhost:5500',
     'http://localhost:3000',
-    'https://ermiasgelaye.github.io/Photography/Home.html',
-    'https://photo-backend-ten.vercel.app/'
+    'https://photo-backend-ten.vercel.app'
 ];
 
 app.use(cors({
     origin: function(origin, callback) {
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.some(allowed => origin.startsWith(allowed))) {
+        if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
             console.log('Blocked by CORS:', origin);
-            callback(null, true); // Temporarily allow all
+            callback(new Error('Not allowed by CORS'));
         }
     },
-    credentials: true
+    credentials: true,
+    optionsSuccessStatus: 200
 }));
 
-app.use(express.json());
+// --- RATE LIMITING ---
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP'
+});
+app.use('/api/', limiter);
 
-// --- PAYMENT CONFIG ---
-const PRICE_AMOUNT_CENTS = 3000; // $30.00
-const PRICE_AMOUNT_STRING = '30.00';
+// --- MONGOOSE SETUP ---
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/photo_gallery', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+}).then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
 
-// --- STRIPE SETUP ---
-let stripe;
+// --- DATABASE SCHEMAS ---
+const userSchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true },
+    email: { type: String },
+    machineId: { type: String },
+    fingerprint: { type: String },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const downloadSchema = new mongoose.Schema({
+    userId: { type: String, required: true },
+    imageId: { type: String, required: true },
+    imageTitle: { type: String },
+    downloadedAt: { type: Date, default: Date.now },
+    watermarked: { type: Boolean, default: true },
+    unlimitedAccess: { type: Boolean, default: false },
+    ipAddress: { type: String },
+    userAgent: { type: String }
+});
+
+const paymentSchema = new mongoose.Schema({
+    userId: { type: String, required: true },
+    paymentId: { type: String, required: true, unique: true },
+    amount: { type: Number, required: true },
+    currency: { type: String, default: 'USD' },
+    status: { type: String, enum: ['pending', 'completed', 'failed', 'refunded'], default: 'pending' },
+    paymentMethod: { type: String, enum: ['stripe', 'paypal', 'manual'] },
+    unlimitedAccess: { type: Boolean, default: false },
+    activationCode: { type: String },
+    expiresAt: { type: Date },
+    createdAt: { type: Date, default: Date.now },
+    metadata: { type: Map, of: mongoose.Schema.Types.Mixed }
+});
+
+const unlimitedAccessSchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true },
+    activationCode: { type: String, required: true, unique: true },
+    paymentId: { type: String, required: true },
+    email: { type: String },
+    machineIds: { type: [String], default: [] },
+    features: { type: [String], default: [] },
+    activatedAt: { type: Date, default: Date.now },
+    expiresAt: { type: Date, required: true },
+    downloadsCount: { type: Number, default: 0 },
+    isActive: { type: Boolean, default: true },
+    lastDownloadAt: { type: Date }
+});
+
+// AI Analysis Schema
+const aiAnalysisSchema = new mongoose.Schema({
+    imageId: { type: String, required: true },
+    analysis: {
+        description: { type: String },
+        tags: { type: [String] },
+        colors: { type: [String] },
+        composition: { type: String },
+        technical: {
+            aperture: { type: String },
+            shutterSpeed: { type: String },
+            iso: { type: Number },
+            focalLength: { type: String }
+        },
+        mood: { type: String },
+        similarImages: { type: [String] }
+    },
+    analyzedAt: { type: Date, default: Date.now },
+    model: { type: String, default: 'gpt-4-vision-preview' }
+});
+
+// Create models
+const User = mongoose.model('User', userSchema);
+const Download = mongoose.model('Download', downloadSchema);
+const Payment = mongoose.model('Payment', paymentSchema);
+const UnlimitedAccess = mongoose.model('UnlimitedAccess', unlimitedAccessSchema);
+const AIAnalysis = mongoose.model('AIAnalysis', aiAnalysisSchema);
+
+// --- PAYMENT PROVIDERS SETUP ---
+let stripe, paypalClient, openai;
+
+// Stripe
 if (process.env.STRIPE_SECRET_KEY) {
-    stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+    stripe = Stripe(process.env.STRIPE_SECRET_KEY);
     console.log('✅ Stripe initialized');
 }
 
-// --- PAYPAL SETUP ---
-let paypalClient = null;
+// PayPal
 if (process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_SECRET) {
     try {
-        const paypal = require('@paypal/checkout-server-sdk');
-        
-        // Determine environment based on client ID
         let environment;
         if (process.env.PAYPAL_CLIENT_ID.startsWith('A')) {
-            // Live environment - production client IDs start with 'A'
-            console.log('🟢 Using PayPal LIVE environment');
             environment = new paypal.core.LiveEnvironment(
                 process.env.PAYPAL_CLIENT_ID,
                 process.env.PAYPAL_SECRET
             );
+            console.log('🟢 Using PayPal LIVE environment');
         } else {
-            // Sandbox environment
-            console.log('🟡 Using PayPal SANDBOX environment');
             environment = new paypal.core.SandboxEnvironment(
                 process.env.PAYPAL_CLIENT_ID,
                 process.env.PAYPAL_SECRET
             );
+            console.log('🟡 Using PayPal SANDBOX environment');
         }
-        
         paypalClient = new paypal.core.PayPalHttpClient(environment);
-        console.log('✅ PayPal client initialized successfully');
+        console.log('✅ PayPal client initialized');
     } catch (e) {
         console.error('❌ PayPal init failed:', e.message);
     }
 }
 
-// --- DOWNLOAD TRACKING SETUP ---
-let downloadTracker = new Map();
-let ipTracker = new Map();
-let unlimitedAccessTracker = new Map();
+// OpenAI
+if (process.env.OPENAI_API_KEY) {
+    openai = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY
+    });
+    console.log('✅ OpenAI initialized');
+}
 
-// Clean up old entries daily
-setInterval(() => {
-    const now = Date.now();
-    const oneDay = 24 * 60 * 60 * 1000;
-    
-    // Clean download tracker (30 days)
-    for (const [key, data] of downloadTracker.entries()) {
-        if (now - data.lastCheck > (30 * oneDay)) {
-            downloadTracker.delete(key);
-        }
-    }
-    
-    // Clean IP tracker (7 days)
-    for (const [key, data] of ipTracker.entries()) {
-        if (now - data.lastCheck > (7 * oneDay)) {
-            ipTracker.delete(key);
-        }
-    }
-    
-    // Clean expired unlimited access
-    for (const [key, data] of unlimitedAccessTracker.entries()) {
-        if (data.expires && now > data.expires) {
-            unlimitedAccessTracker.delete(key);
-        }
-    }
-}, 24 * 60 * 60 * 1000);
+// --- UTILITY FUNCTIONS ---
+const generateActivationCode = () => {
+    return `ARC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+};
+
+const validateEmail = (email) => {
+    const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return re.test(email);
+};
 
 // --- ROUTES ---
 
-app.get('/', (req, res) => {
-    res.send('Photography Backend API is Running. Use /api/health to check status.');
-});
-
+// 1. Health Check
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
+    res.json({
+        status: 'healthy',
         timestamp: new Date(),
         services: {
+            mongodb: mongoose.connection.readyState === 1,
             stripe: !!stripe,
             paypal: !!paypalClient,
-            price: `$${PRICE_AMOUNT_STRING}`,
-            downloadTracking: true,
-            unlimitedAccess: true
-        }
+            openai: !!openai,
+            memoryUsage: process.memoryUsage()
+        },
+        uptime: process.uptime()
     });
 });
 
-// --- STRIPE CHECKOUT ---
-app.post('/api/create-checkout-session', async (req, res) => {
-    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-
+// 2. User Registration & Tracking
+app.post('/api/register-user', async (req, res) => {
     try {
-        const { userId, email } = req.body;
+        const { userId, email, machineId, fingerprint } = req.body;
         
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-                price_data: {
-                    currency: 'usd',
-                    product_data: {
-                        name: 'Unlimited Gallery Access - 1 Year',
-                        description: 'High-resolution downloads with no watermarks',
-                    },
-                    unit_amount: PRICE_AMOUNT_CENTS,
-                },
-                quantity: 1,
-            }],
-            mode: 'payment',
-            success_url: `${SITE_BASE_URL}/index.html?payment=success&userId=${userId}&email=${encodeURIComponent(email || '')}`,
-            cancel_url: `${SITE_BASE_URL}/index.html?payment=cancelled`,
-            metadata: {
-                userId: userId || 'unknown',
-                email: email || 'unknown'
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+        
+        let user = await User.findOne({ userId });
+        
+        if (!user) {
+            user = new User({
+                userId,
+                email: validateEmail(email) ? email : null,
+                machineId,
+                fingerprint
+            });
+            await user.save();
+        }
+        
+        res.json({
+            success: true,
+            user: {
+                userId: user.userId,
+                email: user.email,
+                createdAt: user.createdAt
             }
         });
-
-        res.json({ id: session.id });
+        
     } catch (error) {
-        console.error('Stripe error:', error);
+        console.error('User registration error:', error);
+        res.status(500).json({ error: 'Failed to register user' });
+    }
+});
+
+// 3. Enhanced Download Tracking
+app.post('/api/track-download', async (req, res) => {
+    try {
+        const { userId, imageId, imageTitle, unlimitedAccess, activationCode } = req.body;
+        
+        if (!userId || !imageId) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+        
+        // Check unlimited access if provided
+        let unlimitedData = null;
+        if (activationCode) {
+            unlimitedData = await UnlimitedAccess.findOne({
+                activationCode,
+                isActive: true,
+                expiresAt: { $gt: new Date() }
+            });
+        }
+        
+        // Check if user has active unlimited access
+        if (!unlimitedData) {
+            unlimitedData = await UnlimitedAccess.findOne({
+                userId,
+                isActive: true,
+                expiresAt: { $gt: new Date() }
+            });
+        }
+        
+        const isUnlimited = !!unlimitedData;
+        const ip = req.ip;
+        const userAgent = req.get('User-Agent');
+        
+        // Record download
+        const download = new Download({
+            userId,
+            imageId,
+            imageTitle,
+            watermarked: !isUnlimited,
+            unlimitedAccess: isUnlimited,
+            ipAddress: ip,
+            userAgent
+        });
+        await download.save();
+        
+        // Update unlimited access stats
+        if (isUnlimited && unlimitedData) {
+            unlimitedData.downloadsCount += 1;
+            unlimitedData.lastDownloadAt = new Date();
+            await unlimitedData.save();
+        }
+        
+        // Check download limits for free users
+        if (!isUnlimited) {
+            const downloadsToday = await Download.countDocuments({
+                userId,
+                downloadedAt: {
+                    $gte: new Date(new Date().setHours(0, 0, 0, 0))
+                }
+            });
+            
+            const downloadsThisMonth = await Download.countDocuments({
+                userId,
+                downloadedAt: {
+                    $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+                }
+            });
+            
+            const monthlyLimit = 20; // Free downloads per month
+            const dailyLimit = 5; // Free downloads per day
+            
+            if (downloadsToday >= dailyLimit) {
+                return res.status(429).json({
+                    success: false,
+                    message: 'Daily download limit reached',
+                    limit: dailyLimit,
+                    used: downloadsToday,
+                    reset: 'tomorrow'
+                });
+            }
+            
+            if (downloadsThisMonth >= monthlyLimit) {
+                return res.status(429).json({
+                    success: false,
+                    message: 'Monthly download limit reached',
+                    limit: monthlyLimit,
+                    used: downloadsThisMonth,
+                    reset: 'next month'
+                });
+            }
+        }
+        
+        res.json({
+            success: true,
+            unlimited: isUnlimited,
+            watermarked: !isUnlimited,
+            downloadId: download._id,
+            message: isUnlimited ? 'High-resolution download processed' : 'Watermarked download processed'
+        });
+        
+    } catch (error) {
+        console.error('Download tracking error:', error);
+        res.status(500).json({ error: 'Failed to track download' });
+    }
+});
+
+// 4. Stripe Checkout
+app.post('/api/create-stripe-session', async (req, res) => {
+    if (!stripe) {
+        return res.status(500).json({ error: 'Stripe not configured' });
+    }
+    
+    try {
+        const { userId, email, plan = 'yearly' } = req.body;
+        
+        if (!userId || !validateEmail(email)) {
+            return res.status(400).json({ error: 'Valid user ID and email are required' });
+        }
+        
+        const plans = {
+            yearly: {
+                priceId: process.env.STRIPE_YEARLY_PRICE_ID,
+                amount: 3000, // $30.00
+                name: '1 Year Unlimited Access'
+            },
+            monthly: {
+                priceId: process.env.STRIPE_MONTHLY_PRICE_ID,
+                amount: 500, // $5.00
+                name: 'Monthly Unlimited Access'
+            },
+            lifetime: {
+                priceId: process.env.STRIPE_LIFETIME_PRICE_ID,
+                amount: 15000, // $150.00
+                name: 'Lifetime Unlimited Access'
+            }
+        };
+        
+        const selectedPlan = plans[plan] || plans.yearly;
+        
+        // Create customer in Stripe
+        const customer = await stripe.customers.create({
+            email,
+            metadata: { userId }
+        });
+        
+        // Create checkout session
+        const session = await stripe.checkout.sessions.create({
+            customer: customer.id,
+            payment_method_types: ['card'],
+            line_items: [{
+                price: selectedPlan.priceId,
+                quantity: 1
+            }],
+            mode: 'subscription',
+            success_url: `${SITE_BASE_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}&user_id=${userId}`,
+            cancel_url: `${SITE_BASE_URL}/payment-canceled`,
+            metadata: {
+                userId,
+                plan,
+                amount: selectedPlan.amount
+            }
+        });
+        
+        // Record payment attempt
+        const payment = new Payment({
+            userId,
+            paymentId: session.id,
+            amount: selectedPlan.amount,
+            status: 'pending',
+            paymentMethod: 'stripe',
+            metadata: {
+                plan,
+                customerId: customer.id,
+                sessionUrl: session.url
+            }
+        });
+        await payment.save();
+        
+        res.json({
+            success: true,
+            sessionId: session.id,
+            url: session.url,
+            customerId: customer.id
+        });
+        
+    } catch (error) {
+        console.error('Stripe session error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// --- PAYPAL ORDER CREATE ---
+// 5. PayPal Order
 app.post('/api/create-paypal-order', async (req, res) => {
-    console.log('📝 Creating PayPal order...');
-    
     if (!paypalClient) {
-        console.error('PayPal client not configured');
-        return res.status(500).json({ error: 'PayPal not configured on server' });
+        return res.status(500).json({ error: 'PayPal not configured' });
     }
-
+    
     try {
-        const { userId, email } = req.body;
+        const { userId, email, plan = 'yearly' } = req.body;
         
-        const paypal = require('@paypal/checkout-server-sdk');
+        if (!userId || !validateEmail(email)) {
+            return res.status(400).json({ error: 'Valid user ID and email are required' });
+        }
+        
+        const plans = {
+            yearly: { amount: '30.00', name: '1 Year Unlimited' },
+            monthly: { amount: '5.00', name: 'Monthly Unlimited' },
+            lifetime: { amount: '150.00', name: 'Lifetime Unlimited' }
+        };
+        
+        const selectedPlan = plans[plan] || plans.yearly;
+        const orderId = `PAYPAL-${Date.now()}-${Math.random().toString(36).substr(2, 8)}`;
+        
         const request = new paypal.orders.OrdersCreateRequest();
         request.prefer("return=representation");
         
@@ -189,803 +468,515 @@ app.post('/api/create-paypal-order', async (req, res) => {
             purchase_units: [{
                 amount: {
                     currency_code: 'USD',
-                    value: PRICE_AMOUNT_STRING
+                    value: selectedPlan.amount,
+                    breakdown: {
+                        item_total: {
+                            currency_code: 'USD',
+                            value: selectedPlan.amount
+                        }
+                    }
                 },
-                description: 'Unlimited Gallery Access - 1 Year',
-                custom_id: userId || 'unknown',
-                invoice_id: `INV-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`
+                items: [{
+                    name: `${selectedPlan.name} - ARC Nature Photography`,
+                    description: 'Unlimited high-resolution downloads, no watermarks, commercial license',
+                    quantity: '1',
+                    unit_amount: {
+                        currency_code: 'USD',
+                        value: selectedPlan.amount
+                    }
+                }],
+                custom_id: userId,
+                invoice_id: orderId
             }],
             application_context: {
                 brand_name: 'ARC-NATURE PHOTOGRAPHY',
                 landing_page: 'BILLING',
                 user_action: 'PAY_NOW',
-                return_url: `${SITE_BASE_URL}/index.html?payment=success&method=paypal&userId=${userId}&email=${encodeURIComponent(email || '')}`,
-                cancel_url: `${SITE_BASE_URL}/index.html?payment=cancelled&method=paypal`
+                return_url: `${SITE_BASE_URL}/payment-success?provider=paypal&order_id={order_id}&user_id=${userId}`,
+                cancel_url: `${SITE_BASE_URL}/payment-canceled`
             }
         });
-
-        console.log('Sending PayPal order request...');
+        
         const order = await paypalClient.execute(request);
-        console.log('✅ PayPal order created:', order.result.id);
         
-        res.json({ 
-            success: true,
-            id: order.result.id,
-            status: order.result.status 
-        });
-        
-    } catch (error) {
-        console.error('❌ PayPal order creation failed:', error);
-        
-        res.status(500).json({ 
-            error: 'Failed to create PayPal order',
-            details: error.message || 'Unknown error'
-        });
-    }
-});
-
-// --- PAYPAL ORDER CAPTURE ---
-app.post('/api/capture-paypal-order', async (req, res) => {
-    console.log('💰 Capturing PayPal order...');
-    
-    if (!paypalClient) {
-        return res.status(500).json({ error: 'PayPal not configured' });
-    }
-
-    try {
-        const { orderID, userId, email, machineId } = req.body;
-        
-        if (!orderID) {
-            return res.status(400).json({ error: 'Missing orderID' });
-        }
-
-        console.log('Capturing order:', orderID);
-        
-        const paypal = require('@paypal/checkout-server-sdk');
-        const request = new paypal.orders.OrdersCaptureRequest(orderID);
-        request.requestBody({});
-
-        const capture = await paypalClient.execute(request);
-        console.log('✅ PayPal order captured:', capture.result.id);
-        
-        // Create activation data
-        const activationCode = `UL-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
-        const expires = Date.now() + (365 * 24 * 60 * 60 * 1000); // 1 year
-        
-        const unlimitedData = {
-            userId: userId || 'unknown',
-            machineId: machineId || 'unknown',
-            paymentId: orderID,
+        // Record payment attempt
+        const payment = new Payment({
+            userId,
+            paymentId: order.result.id,
+            amount: parseFloat(selectedPlan.amount) * 100,
+            status: 'pending',
             paymentMethod: 'paypal',
-            email: email || null,
-            activationCode,
-            unlimitedAccess: true,
-            activated: Date.now(),
-            expires: expires,
-            devices: machineId ? [machineId] : [],
-            features: [
-                'unlimited_high_resolution_downloads',
-                'no_watermarks',
-                'commercial_license',
-                'priority_support',
-                'exclusive_photos',
-                'early_access'
-            ],
-            downloadsCount: 0,
-            lastDownload: null,
-            downloadHistory: []
-        };
-        
-        // Store unlimited access
-        const userKey = `unlimited_user_${userId}`;
-        const activationKey = `activation_${activationCode}`;
-        const paymentKey = `payment_${orderID}`;
-        
-        unlimitedAccessTracker.set(userKey, unlimitedData);
-        unlimitedAccessTracker.set(activationKey, unlimitedData);
-        unlimitedAccessTracker.set(paymentKey, unlimitedData);
-        
-        if (machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedAccessTracker.set(machineKey, unlimitedData);
-        }
-        
-        res.json({ 
-            success: true,
-            capture: capture.result,
-            activationCode,
-            expires,
-            features: unlimitedData.features,
-            message: 'Payment successful! Unlimited access activated.'
-        });
-        
-    } catch (error) {
-        console.error('❌ PayPal capture failed:', error);
-        
-        res.status(500).json({ 
-            error: 'Failed to capture PayPal payment',
-            details: error.message || 'Unknown error'
-        });
-    }
-});
-
-// --- DOWNLOAD TRACKING API ---
-
-// 1. Check if user can download
-app.post('/api/check-download-allowance', (req, res) => {
-    try {
-        const { userId, userFingerprint, machineId } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({ error: 'Missing user identification' });
-        }
-        
-        const currentYear = new Date().getFullYear();
-        const ip = req.ip;
-        
-        // Check unlimited access first
-        const userKey = `unlimited_user_${userId}`;
-        let unlimitedData = unlimitedAccessTracker.get(userKey);
-        
-        if (!unlimitedData && machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedData = unlimitedAccessTracker.get(machineKey);
-        }
-        
-        if (unlimitedData) {
-            // Check if expired
-            if (Date.now() > unlimitedData.expires) {
-                return res.json({
-                    canDownload: false,
-                    remainingDownloads: 0,
-                    unlimitedAccess: false,
-                    message: 'Your unlimited access has expired'
-                });
+            metadata: {
+                plan,
+                orderId: order.result.id,
+                status: order.result.status
             }
-            
-            return res.json({
-                canDownload: true,
-                remainingDownloads: 'unlimited',
-                unlimitedAccess: true,
-                features: unlimitedData.features,
-                downloadsCount: unlimitedData.downloadsCount || 0
-            });
-        }
-        
-        // Regular download tracking
-        const userKeyRegular = `${userId}_${currentYear}`;
-        const machineKey = machineId ? `machine_${machineId}_${currentYear}` : null;
-        const ipKey = `ip_${ip}_${currentYear}`;
-        
-        let downloadsUsed = 0;
-        
-        // Check user tracking
-        let userData = downloadTracker.get(userKeyRegular);
-        if (userData) {
-            downloadsUsed = Math.max(downloadsUsed, userData.downloadsUsed);
-        }
-        
-        // Check machine tracking
-        if (machineKey) {
-            const machineData = downloadTracker.get(machineKey);
-            if (machineData) {
-                downloadsUsed = Math.max(downloadsUsed, machineData.downloadsUsed);
-            }
-        }
-        
-        // Check IP tracking
-        const ipData = ipTracker.get(ipKey);
-        if (ipData) {
-            downloadsUsed = Math.max(downloadsUsed, ipData.downloadsUsed);
-        }
-        
-        // Check download limit
-        if (downloadsUsed >= 3) {
-            return res.json({
-                canDownload: false,
-                remainingDownloads: 0,
-                downloadsUsed: downloadsUsed,
-                message: 'You have used all free downloads for this year'
-            });
-        }
+        });
+        await payment.save();
         
         res.json({
-            canDownload: true,
-            remainingDownloads: 3 - downloadsUsed,
-            unlimitedAccess: false,
-            downloadsUsed: downloadsUsed
+            success: true,
+            orderId: order.result.id,
+            status: order.result.status,
+            links: order.result.links
         });
         
     } catch (error) {
-        console.error('Download check error:', error);
-        res.status(500).json({ error: 'Failed to check download allowance' });
+        console.error('PayPal order error:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
-// 2. Register a download
-app.post('/api/register-download', (req, res) => {
+// 6. Payment Webhooks
+app.post('/api/webhooks/stripe', express.raw({type: 'application/json'}), async (req, res) => {
+    if (!stripe) {
+        return res.status(500).json({ error: 'Stripe not configured' });
+    }
+    
+    const sig = req.headers['stripe-signature'];
+    let event;
+    
     try {
-        const { userId, userFingerprint, machineId, imageId, imageTitle } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({ error: 'Missing user identification' });
+        event = stripe.webhooks.constructEvent(
+            req.body,
+            sig,
+            process.env.STRIPE_WEBHOOK_SECRET
+        );
+    } catch (err) {
+        console.error('Webhook signature verification failed:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    
+    try {
+        switch (event.type) {
+            case 'checkout.session.completed':
+                const session = event.data.object;
+                
+                // Update payment status
+                await Payment.findOneAndUpdate(
+                    { paymentId: session.id },
+                    {
+                        status: 'completed',
+                        metadata: { ...session.metadata, completedAt: new Date() }
+                    }
+                );
+                
+                // Activate unlimited access
+                if (session.metadata && session.metadata.userId) {
+                    const activationCode = generateActivationCode();
+                    
+                    // Calculate expiration based on plan
+                    let expiresAt = new Date();
+                    if (session.metadata.plan === 'yearly') {
+                        expiresAt.setFullYear(expiresAt.getFullYear() + 1);
+                    } else if (session.metadata.plan === 'monthly') {
+                        expiresAt.setMonth(expiresAt.getMonth() + 1);
+                    } else if (session.metadata.plan === 'lifetime') {
+                        expiresAt.setFullYear(expiresAt.getFullYear() + 100); // 100 years = lifetime
+                    }
+                    
+                    const unlimitedAccess = new UnlimitedAccess({
+                        userId: session.metadata.userId,
+                        activationCode,
+                        paymentId: session.id,
+                        email: session.customer_email,
+                        features: [
+                            'unlimited_high_resolution_downloads',
+                            'no_watermarks',
+                            'commercial_license',
+                            'priority_support',
+                            'exclusive_photos',
+                            'early_access',
+                            'ai_analysis'
+                        ],
+                        expiresAt,
+                        isActive: true
+                    });
+                    
+                    await unlimitedAccess.save();
+                    
+                    // TODO: Send activation email
+                    console.log(`Unlimited access activated for user: ${session.metadata.userId}`);
+                }
+                break;
+                
+            case 'customer.subscription.deleted':
+                // Handle subscription cancellation
+                const subscription = event.data.object;
+                // Update user's access status
+                break;
         }
         
-        // Check unlimited access first
-        const userKey = `unlimited_user_${userId}`;
-        let unlimitedData = unlimitedAccessTracker.get(userKey);
+        res.json({ received: true });
+    } catch (error) {
+        console.error('Webhook processing error:', error);
+        res.status(500).json({ error: 'Webhook processing failed' });
+    }
+});
+
+// 7. AI Image Analysis
+app.post('/api/analyze-image', async (req, res) => {
+    if (!openai) {
+        return res.status(500).json({ error: 'OpenAI not configured' });
+    }
+    
+    try {
+        const { imageUrl, imageId, analyzeFor = 'general' } = req.body;
         
-        if (!unlimitedData && machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedData = unlimitedAccessTracker.get(machineKey);
+        if (!imageUrl) {
+            return res.status(400).json({ error: 'Image URL is required' });
         }
         
-        if (unlimitedData) {
-            // Check if expired
-            if (Date.now() > unlimitedData.expires) {
-                return res.status(403).json({
-                    success: false,
-                    message: 'Your unlimited access has expired'
-                });
-            }
-            
-            // Track unlimited download
-            unlimitedData.downloadsCount = (unlimitedData.downloadsCount || 0) + 1;
-            unlimitedData.lastDownload = Date.now();
-            
-            if (!unlimitedData.downloadHistory) {
-                unlimitedData.downloadHistory = [];
-            }
-            
-            unlimitedData.downloadHistory.push({
-                imageId,
-                imageTitle,
-                timestamp: Date.now(),
-                noWatermark: true,
-                highResolution: true
-            });
-            
-            // Update stored data
-            const activationKey = `activation_${unlimitedData.activationCode}`;
-            unlimitedAccessTracker.set(userKey, unlimitedData);
-            unlimitedAccessTracker.set(activationKey, unlimitedData);
-            
-            if (machineId) {
-                const machineKey = `unlimited_machine_${machineId}`;
-                unlimitedAccessTracker.set(machineKey, unlimitedData);
-            }
-            
+        // Check cache first
+        const cachedAnalysis = await AIAnalysis.findOne({ imageId }).sort({ analyzedAt: -1 });
+        if (cachedAnalysis) {
             return res.json({
                 success: true,
-                unlimitedAccess: true,
-                noWatermark: true,
-                highResolution: true,
-                commercialLicense: true,
-                downloadsCount: unlimitedData.downloadsCount,
-                expires: unlimitedData.expires,
-                message: 'Unlimited download processed'
+                analysis: cachedAnalysis.analysis,
+                cached: true,
+                analyzedAt: cachedAnalysis.analyzedAt
             });
         }
         
-        // Regular download tracking
-        const currentYear = new Date().getFullYear();
-        const ip = req.ip;
-        
-        const userKeyRegular = `${userId}_${currentYear}`;
-        const machineKey = machineId ? `machine_${machineId}_${currentYear}` : null;
-        const ipKey = `ip_${ip}_${currentYear}`;
-        
-        let userData = downloadTracker.get(userKeyRegular);
-        let machineData = machineKey ? downloadTracker.get(machineKey) : null;
-        let ipData = ipTracker.get(ipKey);
-        
-        let downloadsUsed = 0;
-        if (userData) downloadsUsed = Math.max(downloadsUsed, userData.downloadsUsed);
-        if (machineData) downloadsUsed = Math.max(downloadsUsed, machineData.downloadsUsed);
-        if (ipData) downloadsUsed = Math.max(downloadsUsed, ipData.downloadsUsed);
-        
-        // Check if already downloaded 3 times
-        if (downloadsUsed >= 3) {
-            return res.status(403).json({
-                success: false,
-                message: 'Download limit reached for this device. Please purchase unlimited access.',
-                remainingDownloads: 0,
-                downloadsUsed: downloadsUsed
-            });
+        // Prepare prompt based on analysis type
+        let prompt = "Analyze this photography image and provide:";
+        if (analyzeFor === 'general') {
+            prompt += "1. A detailed description of the scene\n2. 10 relevant tags\n3. Main color palette\n4. Composition analysis\n5. Estimated technical details (aperture, shutter speed, ISO, focal length)\n6. Mood/emotion conveyed\n7. Similar photographic styles";
+        } else if (analyzeFor === 'technical') {
+            prompt += "Technical analysis including likely camera settings, lighting conditions, post-processing techniques, and photographic principles used";
+        } else if (analyzeFor === 'artistic') {
+            prompt += "Artistic analysis including composition, color theory, emotional impact, and artistic influences";
         }
         
-        // Register download for user
-        if (!userData) {
-            userData = {
-                userId,
-                userFingerprint,
-                machineId,
-                downloadsUsed: downloadsUsed + 1,
-                unlimitedAccess: false,
-                downloadHistory: [{
-                    imageId,
-                    imageTitle,
-                    timestamp: Date.now(),
-                    ip: ip,
-                    watermarked: true
-                }],
-                firstDownload: Date.now(),
-                lastDownload: Date.now(),
-                lastCheck: Date.now()
-            };
-        } else {
-            userData.downloadsUsed = downloadsUsed + 1;
-            userData.downloadHistory.push({
-                imageId,
-                imageTitle,
-                timestamp: Date.now(),
-                ip: ip,
-                watermarked: true
-            });
-            userData.lastDownload = Date.now();
-            userData.lastCheck = Date.now();
-        }
-        
-        // Register download for machine
-        if (machineKey) {
-            if (!machineData) {
-                machineData = {
-                    machineId,
-                    downloadsUsed: downloadsUsed + 1,
-                    userIds: [userId],
-                    firstDownload: Date.now(),
-                    lastDownload: Date.now(),
-                    lastCheck: Date.now()
-                };
-            } else {
-                machineData.downloadsUsed = downloadsUsed + 1;
-                machineData.lastDownload = Date.now();
-                machineData.lastCheck = Date.now();
-                if (!machineData.userIds.includes(userId)) {
-                    machineData.userIds.push(userId);
+        // Call OpenAI Vision API
+        const response = await openai.chat.completions.create({
+            model: "gpt-4-vision-preview",
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        { type: "text", text: prompt },
+                        { type: "image_url", image_url: { url: imageUrl } }
+                    ]
                 }
-            }
-            downloadTracker.set(machineKey, machineData);
-        }
-        
-        // Register download for IP
-        if (!ipData) {
-            ipData = {
-                ip,
-                downloadsUsed: downloadsUsed + 1,
-                userIds: [userId],
-                firstDownload: Date.now(),
-                lastDownload: Date.now(),
-                lastCheck: Date.now()
-            };
-        } else {
-            ipData.downloadsUsed = downloadsUsed + 1;
-            ipData.lastDownload = Date.now();
-            ipData.lastCheck = Date.now();
-            if (!ipData.userIds.includes(userId)) {
-                ipData.userIds.push(userId);
-            }
-        }
-        
-        downloadTracker.set(userKeyRegular, userData);
-        ipTracker.set(ipKey, ipData);
-        
-        const remainingDownloads = 3 - (downloadsUsed + 1);
-        
-        res.json({
-            success: true,
-            remainingDownloads: remainingDownloads,
-            downloadsUsed: downloadsUsed + 1,
-            watermarked: true,
-            message: remainingDownloads === 0 ? 'No downloads remaining!' : 
-                    remainingDownloads === 1 ? 'Only 1 download remaining!' : null
+            ],
+            max_tokens: 1000
         });
         
-    } catch (error) {
-        console.error('Register download error:', error);
-        res.status(500).json({ error: 'Failed to register download' });
-    }
-});
-
-// 3. Register device for unlimited access
-app.post('/api/register-device', (req, res) => {
-    try {
-        const { userId, machineId, paymentId, paymentMethod, email } = req.body;
+        // Parse response
+        const analysisText = response.choices[0].message.content;
         
-        if (!userId || !paymentId) {
-            return res.status(400).json({ error: 'Missing required fields' });
-        }
-        
-        const activationCode = `UL-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
-        const expires = Date.now() + (365 * 24 * 60 * 60 * 1000); // 1 year
-        
-        const unlimitedData = {
-            userId,
-            machineId: machineId || 'unknown',
-            paymentId,
-            paymentMethod: paymentMethod || 'unknown',
-            email: email || null,
-            activationCode,
-            unlimitedAccess: true,
-            activated: Date.now(),
-            expires: expires,
-            devices: machineId ? [machineId] : [],
-            features: [
-                'unlimited_high_resolution_downloads',
-                'no_watermarks',
-                'commercial_license',
-                'priority_support',
-                'exclusive_photos',
-                'early_access'
-            ],
-            downloadsCount: 0,
-            lastDownload: null,
-            downloadHistory: []
+        // Extract structured data (simplified parsing)
+        const analysis = {
+            description: analysisText.split('\n')[0] || analysisText.substring(0, 200),
+            tags: extractTags(analysisText),
+            colors: extractColors(analysisText),
+            composition: extractBetween(analysisText, 'Composition:', '\n') || 'Balanced',
+            technical: {
+                aperture: extractBetween(analysisText, 'Aperture:', ' ') || 'f/8',
+                shutterSpeed: extractBetween(analysisText, 'Shutter speed:', ' ') || '1/125',
+                iso: parseInt(extractBetween(analysisText, 'ISO:', ' ')) || 100,
+                focalLength: extractBetween(analysisText, 'Focal length:', ' ') || '50mm'
+            },
+            mood: extractBetween(analysisText, 'Mood:', '\n') || 'Peaceful',
+            similarImages: []
         };
         
-        // Store in multiple keys for different lookups
-        const userKey = `unlimited_user_${userId}`;
-        const paymentKey = `payment_${paymentId}`;
-        const activationKey = `activation_${activationCode}`;
-        
-        unlimitedAccessTracker.set(userKey, unlimitedData);
-        unlimitedAccessTracker.set(paymentKey, unlimitedData);
-        unlimitedAccessTracker.set(activationKey, unlimitedData);
-        
-        if (machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedAccessTracker.set(machineKey, unlimitedData);
-        }
+        // Save to database
+        const aiAnalysis = new AIAnalysis({
+            imageId: imageId || `img_${Date.now()}`,
+            analysis,
+            model: 'gpt-4-vision-preview'
+        });
+        await aiAnalysis.save();
         
         res.json({
             success: true,
-            activationCode,
-            activated: Date.now(),
-            expires: expires,
-            features: unlimitedData.features,
-            message: 'Device registered for unlimited access'
+            analysis,
+            analyzedAt: aiAnalysis.analyzedAt,
+            model: aiAnalysis.model
         });
         
     } catch (error) {
-        console.error('Device registration error:', error);
-        res.status(500).json({ error: 'Failed to register device' });
+        console.error('AI analysis error:', error);
+        res.status(500).json({ error: 'Failed to analyze image' });
     }
 });
 
-// 4. Verify unlimited access
-app.post('/api/verify-unlimited', (req, res) => {
-    try {
-        const { userId, machineId, activationCode } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({ error: 'Missing user ID' });
-        }
-        
-        // Try different lookup methods
-        let unlimitedData = null;
-        
-        // Try activation code first
-        if (activationCode) {
-            const activationKey = `activation_${activationCode}`;
-            unlimitedData = unlimitedAccessTracker.get(activationKey);
-        }
-        
-        // Try user ID
-        if (!unlimitedData) {
-            const userKey = `unlimited_user_${userId}`;
-            unlimitedData = unlimitedAccessTracker.get(userKey);
-        }
-        
-        // Try machine ID
-        if (!unlimitedData && machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedData = unlimitedAccessTracker.get(machineKey);
-        }
-        
-        if (!unlimitedData) {
-            return res.json({
-                hasUnlimited: false,
-                message: 'No unlimited access found'
-            });
-        }
-        
-        // Check if expired
-        if (Date.now() > unlimitedData.expires) {
-            return res.json({
-                hasUnlimited: false,
-                message: 'Unlimited access has expired'
-            });
-        }
-        
-        res.json({
-            hasUnlimited: true,
-            activated: unlimitedData.activated,
-            expires: unlimitedData.expires,
-            features: unlimitedData.features,
-            downloadsCount: unlimitedData.downloadsCount || 0,
-            activationCode: unlimitedData.activationCode
-        });
-        
-    } catch (error) {
-        console.error('Verify unlimited error:', error);
-        res.status(500).json({ error: 'Failed to verify unlimited access' });
+// Helper functions for AI analysis
+function extractTags(text) {
+    const tagLines = text.match(/\d+\.\s*[^:\n]+:/g);
+    if (tagLines) {
+        return tagLines.slice(0, 10).map(tag => tag.replace(/\d+\.\s*/, '').replace(':', '').trim());
     }
-});
-
-// 5. Download with unlimited access
-app.post('/api/download-unlimited', (req, res) => {
-    try {
-        const { userId, machineId, activationCode, imageId, imageTitle } = req.body;
-        
-        if (!userId || !imageId) {
-            return res.status(400).json({ error: 'Missing required fields' });
-        }
-        
-        // Verify unlimited access
-        let unlimitedData = null;
-        
-        if (activationCode) {
-            const activationKey = `activation_${activationCode}`;
-            unlimitedData = unlimitedAccessTracker.get(activationKey);
-        }
-        
-        if (!unlimitedData) {
-            const userKey = `unlimited_user_${userId}`;
-            unlimitedData = unlimitedAccessTracker.get(userKey);
-        }
-        
-        if (!unlimitedData && machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedData = unlimitedAccessTracker.get(machineKey);
-        }
-        
-        if (!unlimitedData) {
-            return res.status(403).json({
-                success: false,
-                message: 'No unlimited access found'
-            });
-        }
-        
-        // Check expiration
-        if (Date.now() > unlimitedData.expires) {
-            return res.status(403).json({
-                success: false,
-                message: 'Your unlimited access has expired'
-            });
-        }
-        
-        // Track download
-        unlimitedData.downloadsCount = (unlimitedData.downloadsCount || 0) + 1;
-        unlimitedData.lastDownload = Date.now();
-        
-        // Store download history
-        if (!unlimitedData.downloadHistory) {
-            unlimitedData.downloadHistory = [];
-        }
-        
-        unlimitedData.downloadHistory.push({
-            imageId,
-            imageTitle,
-            timestamp: Date.now(),
-            noWatermark: true,
-            highResolution: true
-        });
-        
-        // Update all stored references
-        const userKey = `unlimited_user_${userId}`;
-        const activationKey = `activation_${unlimitedData.activationCode}`;
-        
-        unlimitedAccessTracker.set(userKey, unlimitedData);
-        unlimitedAccessTracker.set(activationKey, unlimitedData);
-        
-        if (machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedAccessTracker.set(machineKey, unlimitedData);
-        }
-        
-        res.json({
-            success: true,
-            noWatermark: true,
-            highResolution: true,
-            commercialLicense: true,
-            downloadsCount: unlimitedData.downloadsCount,
-            expires: unlimitedData.expires,
-            imageUrl: imageId, // Return the original image URL (no watermark)
-            message: 'Unlimited download granted'
-        });
-        
-    } catch (error) {
-        console.error('Unlimited download error:', error);
-        res.status(500).json({ error: 'Failed to process unlimited download' });
-    }
-});
-
-// 6. Activate unlimited access (legacy endpoint)
-app.post('/api/activate-unlimited', (req, res) => {
-    try {
-        const { userId, paymentId, paymentMethod, machineId, email } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({ error: 'Missing user ID' });
-        }
-        
-        const activationCode = `UL-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
-        const expires = Date.now() + (365 * 24 * 60 * 60 * 1000); // 1 year
-        
-        const unlimitedData = {
-            userId,
-            machineId: machineId || 'unknown',
-            paymentId: paymentId || `payment_${Date.now()}`,
-            paymentMethod: paymentMethod || 'unknown',
-            email: email || null,
-            activationCode,
-            unlimitedAccess: true,
-            activated: Date.now(),
-            expires: expires,
-            devices: machineId ? [machineId] : [],
-            features: [
-                'unlimited_high_resolution_downloads',
-                'no_watermarks',
-                'commercial_license',
-                'priority_support',
-                'exclusive_photos',
-                'early_access'
-            ],
-            downloadsCount: 0,
-            lastDownload: null,
-            downloadHistory: []
-        };
-        
-        const userKey = `unlimited_user_${userId}`;
-        const activationKey = `activation_${activationCode}`;
-        
-        unlimitedAccessTracker.set(userKey, unlimitedData);
-        unlimitedAccessTracker.set(activationKey, unlimitedData);
-        
-        if (machineId) {
-            const machineKey = `unlimited_machine_${machineId}`;
-            unlimitedAccessTracker.set(machineKey, unlimitedData);
-        }
-        
-        res.json({
-            success: true,
-            unlimitedAccess: true,
-            activationCode,
-            activated: Date.now(),
-            expires: expires,
-            features: unlimitedData.features,
-            message: 'Unlimited downloads activated for 1 year'
-        });
-        
-    } catch (error) {
-        console.error('Activate unlimited error:', error);
-        res.status(500).json({ error: 'Failed to activate unlimited access' });
-    }
-});
-
-// 7. Get user download history
-app.get('/api/user-downloads/:userId', (req, res) => {
-    try {
-        const { userId } = req.params;
-        
-        // Check for unlimited access first
-        const userKey = `unlimited_user_${userId}`;
-        const unlimitedData = unlimitedAccessTracker.get(userKey);
-        
-        if (unlimitedData) {
-            return res.json({
-                unlimitedAccess: true,
-                downloadsCount: unlimitedData.downloadsCount || 0,
-                downloadsUsed: 0,
-                remainingDownloads: 'unlimited',
-                downloadHistory: unlimitedData.downloadHistory || [],
-                firstDownload: unlimitedData.activated || null,
-                lastDownload: unlimitedData.lastDownload || null,
-                activated: unlimitedData.activated,
-                expires: unlimitedData.expires,
-                features: unlimitedData.features
-            });
-        }
-        
-        // Check regular downloads
-        const currentYear = new Date().getFullYear();
-        const userKeyRegular = `${userId}_${currentYear}`;
-        
-        const userData = downloadTracker.get(userKeyRegular);
-        
-        if (!userData) {
-            return res.json({
-                downloadsUsed: 0,
-                remainingDownloads: 3,
-                unlimitedAccess: false,
-                downloadHistory: [],
-                firstDownload: null,
-                lastDownload: null
-            });
-        }
-        
-        res.json({
-            downloadsUsed: userData.downloadsUsed,
-            remainingDownloads: 3 - userData.downloadsUsed,
-            unlimitedAccess: false,
-            downloadHistory: userData.downloadHistory || [],
-            firstDownload: userData.firstDownload || null,
-            lastDownload: userData.lastDownload || null
-        });
-        
-    } catch (error) {
-        console.error('Get user downloads error:', error);
-        res.status(500).json({ error: 'Failed to get download history' });
-    }
-});
-
-// 8. Get unlimited access info
-app.get('/api/unlimited-info/:userId', (req, res) => {
-    try {
-        const { userId } = req.params;
-        const userKey = `unlimited_user_${userId}`;
-        
-        const unlimitedData = unlimitedAccessTracker.get(userKey);
-        
-        if (!unlimitedData) {
-            return res.json({
-                hasUnlimited: false,
-                message: 'No unlimited access found'
-            });
-        }
-        
-        const expiryDate = new Date(unlimitedData.expires);
-        const daysRemaining = Math.ceil((unlimitedData.expires - Date.now()) / (1000 * 60 * 60 * 24));
-        
-        res.json({
-            hasUnlimited: true,
-            activationCode: unlimitedData.activationCode,
-            activated: unlimitedData.activated,
-            expires: unlimitedData.expires,
-            expiryDate: expiryDate.toISOString(),
-            daysRemaining: daysRemaining,
-            downloadsCount: unlimitedData.downloadsCount || 0,
-            features: unlimitedData.features,
-            email: unlimitedData.email,
-            paymentMethod: unlimitedData.paymentMethod
-        });
-        
-    } catch (error) {
-        console.error('Get unlimited info error:', error);
-        res.status(500).json({ error: 'Failed to get unlimited access info' });
-    }
-});
-
-// --- TEST ENDPOINT ---
-app.get('/api/test-paypal', async (req, res) => {
-    try {
-        if (!paypalClient) {
-            return res.json({ 
-                configured: false,
-                message: 'PayPal not configured. Check PAYPAL_CLIENT_ID and PAYPAL_SECRET env vars.'
-            });
-        }
-        
-        return res.json({
-            configured: true,
-            clientId: process.env.PAYPAL_CLIENT_ID ? 'Set' : 'Missing',
-            secret: process.env.PAYPAL_SECRET ? 'Set' : 'Missing',
-            environment: process.env.PAYPAL_CLIENT_ID?.startsWith('A') ? 'Live' : 'Sandbox',
-            message: 'PayPal SDK is configured'
-        });
-        
-    } catch (error) {
-        res.json({
-            configured: false,
-            error: error.message
-        });
-    }
-});
-
-// Start server (for local dev)
-if (process.env.NODE_ENV !== 'production') {
-    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    return ['nature', 'photography', 'landscape', 'scenic'];
 }
 
-// Export for Vercel
+function extractColors(text) {
+    const colorMatch = text.match(/colors?:?\s*([^.\n]+)/i);
+    if (colorMatch) {
+        return colorMatch[1].split(/[,;]/).map(c => c.trim()).slice(0, 5);
+    }
+    return ['blue', 'green', 'brown', 'white'];
+}
+
+function extractBetween(text, start, end) {
+    const regex = new RegExp(`${start}([^${end}]+)`);
+    const match = text.match(regex);
+    return match ? match[1].trim() : null;
+}
+
+// 8. User Dashboard API
+app.get('/api/user/:userId/dashboard', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        // Get user info
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Get download stats
+        const totalDownloads = await Download.countDocuments({ userId });
+        const unlimitedAccess = await UnlimitedAccess.findOne({
+            userId,
+            isActive: true,
+            expiresAt: { $gt: new Date() }
+        });
+        
+        // Get recent downloads
+        const recentDownloads = await Download.find({ userId })
+            .sort({ downloadedAt: -1 })
+            .limit(10)
+            .select('imageTitle downloadedAt watermarked unlimitedAccess');
+        
+        // Get payment history
+        const payments = await Payment.find({ userId })
+            .sort({ createdAt: -1 })
+            .limit(5)
+            .select('amount status paymentMethod createdAt');
+        
+        res.json({
+            success: true,
+            user: {
+                userId: user.userId,
+                email: user.email,
+                registeredAt: user.createdAt
+            },
+            stats: {
+                totalDownloads,
+                hasUnlimitedAccess: !!unlimitedAccess,
+                unlimitedExpires: unlimitedAccess?.expiresAt,
+                downloadsThisMonth: await Download.countDocuments({
+                    userId,
+                    downloadedAt: {
+                        $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+                    }
+                }),
+                downloadsToday: await Download.countDocuments({
+                    userId,
+                    downloadedAt: {
+                        $gte: new Date(new Date().setHours(0, 0, 0, 0))
+                    }
+                })
+            },
+            unlimitedAccess: unlimitedAccess ? {
+                activationCode: unlimitedAccess.activationCode,
+                activatedAt: unlimitedAccess.activatedAt,
+                expiresAt: unlimitedAccess.expiresAt,
+                downloadsCount: unlimitedAccess.downloadsCount,
+                features: unlimitedAccess.features
+            } : null,
+            recentDownloads,
+            paymentHistory: payments
+        });
+        
+    } catch (error) {
+        console.error('Dashboard error:', error);
+        res.status(500).json({ error: 'Failed to load dashboard' });
+    }
+});
+
+// 9. Image Recommendations (AI-powered)
+app.post('/api/recommendations', async (req, res) => {
+    try {
+        const { userId, basedOn = 'history', limit = 10 } = req.body;
+        
+        let recommendations = [];
+        
+        if (basedOn === 'history' && userId) {
+            // Get user's downloaded images
+            const userDownloads = await Download.find({ userId })
+                .sort({ downloadedAt: -1 })
+                .limit(5)
+                .select('imageId');
+            
+            if (userDownloads.length > 0) {
+                // Get similar images based on tags/categories
+                const downloadedImageIds = userDownloads.map(d => d.imageId);
+                
+                // This is simplified - in production, you'd use a proper recommendation engine
+                // based on image metadata, tags, or AI embeddings
+                
+                // For now, return random "recommendations"
+                recommendations = Array(limit).fill().map((_, i) => ({
+                    imageId: `rec_${i}_${Date.now()}`,
+                    title: `Recommended Image ${i + 1}`,
+                    reason: 'Based on your download history',
+                    score: 0.8 + (Math.random() * 0.2)
+                }));
+            }
+        } else if (basedOn === 'trending') {
+            // Get trending images (most downloaded recently)
+            const trendingDownloads = await Download.aggregate([
+                {
+                    $match: {
+                        downloadedAt: {
+                            $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // Last 7 days
+                        }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$imageId',
+                        count: { $sum: 1 }
+                    }
+                },
+                { $sort: { count: -1 } },
+                { $limit: limit }
+            ]);
+            
+            recommendations = trendingDownloads.map((item, index) => ({
+                imageId: item._id,
+                title: `Trending Image ${index + 1}`,
+                reason: `Downloaded ${item.count} times this week`,
+                score: 0.9
+            }));
+        }
+        
+        // If no specific recommendations, return featured images
+        if (recommendations.length === 0) {
+            recommendations = Array(limit).fill().map((_, i) => ({
+                imageId: `featured_${i}`,
+                title: `Featured Image ${i + 1}`,
+                reason: 'Editor\'s pick',
+                score: 0.95
+            }));
+        }
+        
+        res.json({
+            success: true,
+            basedOn,
+            count: recommendations.length,
+            recommendations
+        });
+        
+    } catch (error) {
+        console.error('Recommendations error:', error);
+        res.status(500).json({ error: 'Failed to get recommendations' });
+    }
+});
+
+// 10. Bulk Operations
+app.post('/api/bulk-download', async (req, res) => {
+    try {
+        const { userId, imageIds, activationCode } = req.body;
+        
+        if (!userId || !imageIds || !Array.isArray(imageIds)) {
+            return res.status(400).json({ error: 'Invalid request' });
+        }
+        
+        if (imageIds.length > 50) {
+            return res.status(400).json({ error: 'Maximum 50 images per bulk download' });
+        }
+        
+        // Check unlimited access
+        let unlimitedAccess = null;
+        if (activationCode) {
+            unlimitedAccess = await UnlimitedAccess.findOne({
+                activationCode,
+                isActive: true,
+                expiresAt: { $gt: new Date() }
+            });
+        }
+        
+        if (!unlimitedAccess) {
+            unlimitedAccess = await UnlimitedAccess.findOne({
+                userId,
+                isActive: true,
+                expiresAt: { $gt: new Date() }
+            });
+        }
+        
+        if (!unlimitedAccess) {
+            return res.status(403).json({
+                error: 'Unlimited access required for bulk downloads',
+                code: 'UNLIMITED_REQUIRED'
+            });
+        }
+        
+        // Create download entries for each image
+        const downloadPromises = imageIds.map(imageId => {
+            const download = new Download({
+                userId,
+                imageId,
+                unlimitedAccess: true,
+                watermarked: false
+            });
+            return download.save();
+        });
+        
+        await Promise.all(downloadPromises);
+        
+        // Update unlimited access stats
+        unlimitedAccess.downloadsCount += imageIds.length;
+        unlimitedAccess.lastDownloadAt = new Date();
+        await unlimitedAccess.save();
+        
+        // Create ZIP file (simplified - in production, you'd generate actual ZIP)
+        const downloadId = `bulk_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        res.json({
+            success: true,
+            downloadId,
+            count: imageIds.length,
+            unlimited: true,
+            message: `Processing ${imageIds.length} images for download`,
+            estimatedTime: `${Math.ceil(imageIds.length * 0.5)} seconds`, // Estimated
+            downloadUrl: `/api/download-bulk/${downloadId}` // This would be another endpoint
+        });
+        
+    } catch (error) {
+        console.error('Bulk download error:', error);
+        res.status(500).json({ error: 'Failed to process bulk download' });
+    }
+});
+
+// --- ERROR HANDLING MIDDLEWARE ---
+app.use((err, req, res, next) => {
+    console.error('Global error handler:', err);
+    
+    // Default error
+    const statusCode = err.statusCode || 500;
+    const message = err.message || 'Internal Server Error';
+    
+    res.status(statusCode).json({
+        success: false,
+        error: message,
+        ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    });
+});
+
+// --- START SERVER ---
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(PORT, () => {
+        console.log(`🚀 Enhanced server running on port ${PORT}`);
+        console.log(`📁 MongoDB: ${mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'}`);
+        console.log(`💳 Stripe: ${stripe ? 'Ready' : 'Not configured'}`);
+        console.log(`💰 PayPal: ${paypalClient ? 'Ready' : 'Not configured'}`);
+        console.log(`🤖 OpenAI: ${openai ? 'Ready' : 'Not configured'}`);
+    });
+}
+
 module.exports = app;
