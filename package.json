@@ -9,12 +9,29 @@
   "dependencies": {
     "@paypal/checkout-server-sdk": "^1.0.3",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
+    "mongoose": "^9.1.1",
     "node-modules": "^1.0.1",
-    "stripe": "^14.0.0"
+    "openai": "^6.15.0",
+    "stripe": "^14.25.0"
   },
   "engines": {
     "node": ">=20.x"
-  }
+  },
+  "description": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ermiasgelaye/photo-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ermiasgelaye/photo-backend/issues"
+  },
+  "homepage": "https://github.com/ermiasgelaye/photo-backend#readme"
 }
