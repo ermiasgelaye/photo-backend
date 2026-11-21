@@ -45,7 +45,7 @@ npm run dev               # http://localhost:3000
 
 ## Deployment
 
-Deployed on Vercel as a single serverless function ([`vercel.json`](vercel.json)). Every push to `master` deploys to production, and secrets are set in the Vercel project settings, never committed.
+Deployed on Vercel as a single serverless function ([`vercel.json`](vercel.json)). Every push to `main` deploys to production, and secrets are set in the Vercel project settings, never committed.
 
 > **Note:** download tracking is stored in memory, so it resets whenever a serverless instance restarts. To make limits and purchases persistent, move it to a database such as Vercel KV, Postgres or MongoDB.
 
